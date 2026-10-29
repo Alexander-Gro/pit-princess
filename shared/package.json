@@ -1,0 +1,14 @@
+{
+  "name": "@pit/shared",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./theme.css": "./src/theme.css",
+    "./noise": "./src/noise.ts"
+  },
+  "dependencies": {
+    "@sapphi-red/web-noise-suppressor": "^0.4.1"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "pit-princess",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "workspaces": [
+    "shared",
+    "server",
+    "phone",
+    "desktop",
+    "e2e"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w server",
+    "dev:phone": "npm run dev -w phone",
+    "dev:desktop": "npm run dev -w desktop",
+    "build:phone": "npm run build -w phone",
+    "start": "npm run build:phone && npm start -w server",
+    "test": "npm test -w server",
+    "typecheck": "tsc -p shared && tsc -p server && tsc -p phone && npm run typecheck -w desktop",
+    "test:e2e": "npm test -w e2e"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

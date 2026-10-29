@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0b0d" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon-192.png" type="image/png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="Pit Princess" />
+    <title>Pit Princess</title>
+  </head>
+  <body>
+    <main id="app">
+      <header class="strip">
+        <div class="tile" id="t-link"><span class="label">Link</span><span class="value" id="v-link">—</span></div>
+        <div class="tile" id="t-ping"><span class="label">Ping</span><span class="value" id="v-ping">—</span></div>
+        <div class="tile" id="t-route"><span class="label">Route</span><span class="value" id="v-route">—</span></div>
+      </header>
+
+      <button class="tile ptt" id="ptt" type="button">
+        <span class="label" id="ptt-sub">Pit Princess</span>
+        <span class="ptt-text" id="ptt-text">TAP TO CONNECT</span>
+      </button>
+
+      <footer>
+        <div id="meter"></div>
+        <div class="foot-row">
+          <button class="chip" id="nr" type="button" hidden></button>
+          <span class="label" id="foot-msg"></span>
+          <span class="label" id="fx-status"></span>
+        </div>
+      </footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,58 @@
+{
+  "name": "@pit/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "productName": "Pit Princess",
+  "description": "Pit Princess PC radio",
+  "author": "Pit Princess",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc -p tsconfig.json",
+    "dist": "electron-vite build && electron-builder --win"
+  },
+  "dependencies": {
+    "@kmamal/sdl": "^0.11.13"
+  },
+  "devDependencies": {
+    "@fontsource/barlow-condensed": "^5.1.0",
+    "@pit/shared": "*",
+    "@types/node": "^22.20.5",
+    "@types/qrcode": "^1.5.6",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^6.0.0",
+    "qrcode": "^1.5.4"
+  },
+  "build": {
+    "appId": "dk.pitprincess.radio",
+    "electronVersion": "45.1.0",
+    "npmRebuild": false,
+    "productName": "Pit Princess",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "asarUnpack": [
+      "**/node_modules/@kmamal/sdl/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ]
+  }
+}

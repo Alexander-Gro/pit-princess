@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: pit-princess
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include-workspace-root -w shared -w server -w phone && npm run build:phone
+    startCommand: npm start -w server
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ELECTRON_SKIP_BINARY_DOWNLOAD
+        value: "1"
+      # Makes the server private: only clients with this key can connect.
+      # Use a long random string and enter the same key in the PC app.
+      - key: ACCESS_KEY
+        sync: false
+      # TURN relay credentials: fill in ONE provider in the Render dashboard
+      - key: CF_TURN_KEY_ID
+        sync: false
+      - key: CF_TURN_KEY_TOKEN
+        sync: false

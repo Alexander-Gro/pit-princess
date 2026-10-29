@@ -1,0 +1,18 @@
+{
+  "name": "@pit/e2e",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild harness/pc.ts --bundle --format=esm --target=es2022 --outfile=dist/pc.js",
+    "test": "npm run build && playwright test",
+    "install-browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "@pit/shared": "*"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "esbuild": "^0.28.2"
+  }
+}

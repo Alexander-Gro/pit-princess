@@ -1,0 +1,149 @@
+/* Pit Princess dashboard theme: dark tiles, condensed type, solid flag-colour status blocks. */
+
+:root {
+  --bg: #0b0b0d;
+  --tile: #1a1b1f;
+  --tile-2: #232429;
+  --line: #2c2d33;
+  --text: #f4f4f6;
+  --muted: #8a8c96;
+  --dim: #55575f;
+
+  --green: #22c55e;
+  --red: #ef3b3b;
+  --blue: #2f7df6;
+  --amber: #f5b40b;
+  --purple: #a855f7;
+  --on-flag: #0b0b0d;
+
+  --radius: 10px;
+  --gap: 8px;
+  --font: 'Barlow Condensed', 'Arial Narrow', 'Roboto Condensed', sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+.tile {
+  background: var(--tile);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  transition: background-color 80ms linear, color 80ms linear;
+}
+
+.tile .label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile .value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile .value.small {
+  font-size: 18px;
+}
+
+/* Solid flag fills */
+.flag-green { background: var(--green); color: var(--on-flag); }
+.flag-red { background: var(--red); color: var(--text); }
+.flag-blue { background: var(--blue); color: var(--text); }
+.flag-amber { background: var(--amber); color: var(--on-flag); }
+.flag-purple { background: var(--purple); color: var(--text); }
+.flag-green .label,
+.flag-amber .label { color: rgba(11, 11, 13, 0.65); }
+.flag-red .label,
+.flag-blue .label,
+.flag-purple .label { color: rgba(255, 255, 255, 0.75); }
+
+.pulse {
+  animation: pulse 900ms ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.18); }
+}
+
+/* Rev-light level meter: a row of segments, green -> amber -> red */
+.revlights {
+  display: grid;
+  grid-template-columns: repeat(var(--segments, 15), 1fr);
+  gap: 4px;
+  height: 14px;
+}
+
+.revlights span {
+  border-radius: 3px;
+  background: var(--tile-2);
+  transition: background-color 40ms linear;
+}
+
+.revlights span.on.g { background: var(--green); }
+.revlights span.on.a { background: var(--amber); }
+.revlights span.on.r { background: var(--red); }
+
+button,
+select,
+input {
+  font-family: var(--font);
+  font-size: 16px;
+  color: var(--text);
+}
+
+.btn {
+  background: var(--tile-2);
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.btn:hover { filter: brightness(1.2); }
+.btn:active { filter: brightness(0.9); }
+.btn.primary { background: var(--purple); }
+
+select,
+input[type='text'] {
+  background: var(--tile-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+input[type='range'] {
+  width: 100%;
+  accent-color: var(--purple);
+}

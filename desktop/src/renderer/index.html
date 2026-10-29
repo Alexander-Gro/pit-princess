@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; media-src 'self' blob:; connect-src *"
+    />
+    <title>Pit Princess</title>
+  </head>
+  <body>
+    <main id="dash">
+      <!-- Status strip -->
+      <div class="tile" id="t-link"><span class="label">Link</span><span class="value" id="v-link">—</span></div>
+      <div class="tile state" id="t-state"><span class="label" id="l-state">Radio</span><span class="value" id="v-state">STANDBY</span></div>
+      <div class="tile" id="t-ping"><span class="label">Ping</span><span class="value" id="v-ping">—</span></div>
+      <div class="tile" id="t-route"><span class="label">Route</span><span class="value" id="v-route">—</span></div>
+
+      <!-- Meters -->
+      <div class="tile meters">
+        <div class="meter-row"><span class="label">TX</span><div id="m-tx"></div></div>
+        <div class="meter-row"><span class="label">RX</span><div id="m-rx"></div></div>
+      </div>
+
+      <!-- Pairing -->
+      <section class="tile pair">
+        <span class="label">Pair phone</span>
+        <div class="pair-body">
+          <canvas id="qr" width="168" height="168"></canvas>
+          <div class="pair-info">
+            <span class="value small" id="v-phone">No phone</span>
+            <a id="phone-link" class="link" href="#" target="_blank">—</a>
+            <div class="row">
+              <button class="btn" id="b-copy" type="button">Copy link</button>
+              <button class="btn" id="b-newcode" type="button">New code</button>
+              <button class="btn" id="b-kick" type="button">Kick</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PTT -->
+      <section class="tile ptt-cfg">
+        <span class="label">Push to talk</span>
+        <span class="value small" id="v-bind">Not bound</span>
+        <span class="hint" id="v-joys">—</span>
+        <div class="row">
+          <button class="btn primary" id="b-bind" type="button">Bind wheel button</button>
+          <button class="btn" id="b-unbind" type="button">Clear</button>
+        </div>
+        <button class="btn hold" id="b-hold" type="button">Hold to talk</button>
+      </section>
+
+      <!-- Crew Chief -->
+      <section class="tile cc" id="t-cc">
+        <span class="label">Crew Chief sounds</span>
+        <span class="value small" id="v-cc">—</span>
+        <span class="hint" id="v-cc-path"></span>
+        <div class="row">
+          <button class="btn" id="b-cc-browse" type="button">Browse…</button>
+          <button class="btn" id="b-cc-test" type="button">Test</button>
+        </div>
+      </section>
+
+      <!-- Audio -->
+      <section class="tile audio">
+        <span class="label">Audio</span>
+        <label>Microphone <select id="s-in"></select></label>
+        <label>Radio output <select id="s-out"></select></label>
+        <span class="hint" id="v-mic"></span>
+        <div class="sliders-head"><span class="label">Your mic</span></div>
+        <div class="sliders mic">
+          <label title="How loud your mic is sent to the phone">Mic level <span class="pct"><input type="number" data-pct="micGain" />%</span><input type="range" id="r-mic" step="0.01" /></label>
+          <label title="Removes background noise from your mic">Noise filter
+            <select id="s-noise">
+              <option value="strong">Strong (AI)</option>
+              <option value="standard">Standard</option>
+              <option value="off">Off</option>
+            </select>
+            <span class="hint" id="v-noise"></span>
+          </label>
+          <label class="check" title="Catches the howl when your mic hears the phone's speaker"><span><input type="checkbox" id="c-fb" /> Feedback suppression</span><span class="hint" id="v-fb"></span></label>
+        </div>
+        <div class="sliders-head">
+          <span class="label">Radio sound</span>
+          <button class="btn small" id="b-fx-reset" type="button">Reset</button>
+        </div>
+        <div class="sliders">
+          <label title="Everything the radio plays">Master <span class="pct"><input type="number" data-pct="volume" />%</span><input type="range" data-fx="volume" step="0.01" /></label>
+          <label title="The phone's voice">Voice <span class="pct"><input type="number" data-pct="voice" />%</span><input type="range" data-fx="voice" step="0.01" /></label>
+          <label title="Crew Chief bleeps and the busy tone">Bleeps <span class="pct"><input type="number" data-pct="bleeps" />%</span><input type="range" data-fx="bleeps" step="0.01" /></label>
+          <label title="Background hiss while the channel is open">Static <span class="pct"><input type="number" data-pct="staticLevel" />%</span><input type="range" data-fx="staticLevel" step="0.01" /></label>
+          <label title="Distortion. Changes the character, not the volume">Grit <span class="pct"><input type="number" data-pct="drive" />%</span><input type="range" data-fx="drive" step="0.01" /></label>
+          <label title="Narrow walkie-talkie to wide and clear">Tone <span class="pct"><input type="number" data-pct="band" />%</span><input type="range" data-fx="band" step="0.01" /></label>
+        </div>
+      </section>
+
+      <!-- Server -->
+      <section class="tile server">
+        <span class="label">Server</span>
+        <div class="row">
+          <input type="text" id="i-server" spellcheck="false" placeholder="http://localhost:8787" />
+        </div>
+        <span class="label">Access key</span>
+        <div class="row">
+          <input type="password" id="i-key" spellcheck="false" autocomplete="off" placeholder="Only if your server requires one" />
+          <button class="btn small" id="b-key-show" type="button">Show</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="b-server" type="button">Save</button>
+        </div>
+        <span class="hint" id="v-server"></span>
+      </section>
+    </main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
