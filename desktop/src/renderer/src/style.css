@@ -75,6 +75,17 @@ section.tile {
   min-width: 0;
 }
 
+.paircode {
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--text);
+}
+
+.paircode[hidden] {
+  display: none;
+}
+
 .link {
   color: var(--muted);
   font-size: 13px;

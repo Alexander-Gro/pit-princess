@@ -38,6 +38,8 @@ export interface RadioLinkOptions {
   onData?: (msg: unknown) => void;
   /** Our data channel to the peer is open */
   onDataOpen?: () => void;
+  /** A pairing code the server created for this room (PC only) */
+  onPairCode?: (code: string, expiresInMs: number) => void;
 }
 
 export class RadioLink {
@@ -108,6 +110,13 @@ export class RadioLink {
     if (track) track.enabled = this.state.tx;
     const sender = this.audioSender();
     if (sender) void sender.replaceTrack(track).catch((e) => console.warn('[link] replaceTrack', e));
+  }
+
+  /** Ask the server for a 6-digit pairing code (PC only). Arrives via onPairCode. */
+  createPairCode(): boolean {
+    if (this.role !== 'pc' || this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.send({ t: 'pair_create' });
+    return true;
   }
 
   /** Kick the phone from the room (PC only). */
@@ -228,6 +237,9 @@ export class RadioLink {
         break;
       case 'ice':
         this.iceServers = msg.iceServers;
+        break;
+      case 'pair_code':
+        this.opts.onPairCode?.(msg.code, msg.expiresInMs);
         break;
       case 'peer_joined':
         this.update({ peerPresent: true });

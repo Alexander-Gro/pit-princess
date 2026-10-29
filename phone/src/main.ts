@@ -8,6 +8,7 @@ import {
   RadioFx,
   RadioLink,
   RevLights,
+  PAIR_CODE_RE,
   ROOM_CODE_RE,
   TxProcessor,
   b64ToBytes,
@@ -88,11 +89,76 @@ function setPtt(text: string, sub: string, cls: string): void {
 }
 
 if (!ROOM_CODE_RE.test(room)) {
-  setPtt('NO ROOM', 'Scan the QR code on the PC', 'disabled');
-  setTile('link', 'NO CODE', 'amber');
+  // A home-screen app on iOS starts without the QR link's room and key, and with storage
+  // separate from Safari's, so it pairs itself with a short code shown on the PC.
+  showPairing();
 } else {
   setTile('link', 'READY', null);
   ptt.addEventListener('click', connect, { once: true });
+}
+
+function showPairing(): void {
+  ptt.hidden = true;
+  setTile('link', 'NOT PAIRED', 'amber');
+  const form = $<HTMLFormElement>('pair');
+  const input = $<HTMLInputElement>('pair-code');
+  const msg = $('pair-msg');
+  form.hidden = false;
+  input.focus();
+  input.addEventListener('input', () => {
+    input.value = input.value.replace(/\D/g, '').slice(0, 6);
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const code = input.value;
+    if (!PAIR_CODE_RE.test(code)) {
+      msg.textContent = 'Enter the 6 digits shown on the PC';
+      return;
+    }
+    msg.textContent = 'Pairing…';
+    try {
+      const { room: newRoom, key } = await claimPairCode(code);
+      try {
+        localStorage.setItem(ROOM_KEY, newRoom);
+        localStorage.setItem(ACCESS_KEY_KEY, key);
+      } catch {
+        /* storage blocked: the URL below still carries them */
+      }
+      location.hash = `room=${newRoom}${key ? `&key=${encodeURIComponent(key)}` : ''}`;
+      location.reload();
+    } catch (err) {
+      msg.textContent = err instanceof Error ? err.message : String(err);
+      input.select();
+    }
+  });
+}
+
+function claimPairCode(code: string): Promise<{ room: string; key: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error('Server not responding, try again'));
+    }, 15_000);
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'pair_claim', code }));
+    ws.onmessage = (ev) => {
+      let m: { t?: string; code?: string; room?: string; key?: string };
+      try {
+        m = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      clearTimeout(timer);
+      ws.close();
+      if (m.t === 'paired' && m.room && ROOM_CODE_RE.test(m.room)) resolve({ room: m.room, key: m.key ?? '' });
+      else if (m.code === 'rate_limited') reject(new Error('Too many wrong codes, wait a few minutes'));
+      else reject(new Error('Wrong or expired code. Make a new one on the PC'));
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error('Could not reach the server'));
+    };
+  });
 }
 
 async function connect(): Promise<void> {
@@ -185,6 +251,16 @@ function renderNoise(fellBack = false): void {
   el.hidden = false;
 }
 
+$('repair').addEventListener('click', () => {
+  try {
+    localStorage.removeItem(ROOM_KEY);
+    localStorage.removeItem(ACCESS_KEY_KEY);
+  } catch {
+    /* ignore */
+  }
+  location.replace(location.pathname);
+});
+
 function bindNoiseToggle(): void {
   const el = $<HTMLButtonElement>('nr');
   el.addEventListener('click', async () => {
@@ -265,6 +341,7 @@ function render(s: LinkState): void {
   setTile('route', s.route === 'relay' ? 'RELAY' : s.route === 'direct' ? 'DIRECT' : '—', s.route === 'relay' ? 'purple' : null);
 
   // PTT tile
+  $('repair').hidden = !(s.error && s.signaling === 'closed');
   if (s.error && s.signaling === 'closed') {
     setPtt('OFFLINE', s.error, 'flag-red');
     footMsg.textContent = 'Reload the page to reconnect';

@@ -171,6 +171,7 @@ function startLink(): void {
     fx,
     onChange: render,
     onDataOpen: sendSoundsToPhone,
+    onPairCode: showPairCode,
   });
   const track = tx?.track ?? null;
   link.setMicTrack(track);
@@ -194,7 +195,8 @@ async function updatePairing(): Promise<void> {
   const url = `${base}/#room=${settings.room}${key}`;
   const a = $<HTMLAnchorElement>('phone-link');
   a.href = url;
-  a.textContent = url;
+  // Show the link without the key; the QR code and Copy link still carry it
+  a.textContent = settings.accessKey ? url.replace(key, '&key=••••••') : url;
   await QRCode.toCanvas($<HTMLCanvasElement>('qr'), url, { width: 168, margin: 1, errorCorrectionLevel: 'M' });
 }
 
@@ -224,7 +226,40 @@ function render(s: LinkState): void {
   setTile('ping', s.rttMs == null ? '—' : `${s.rttMs} ms`, null);
   setTile('route', s.route === 'relay' ? 'RELAY' : s.route === 'direct' ? 'DIRECT' : '—', s.route === 'relay' ? 'purple' : null);
 
+  // The code is single-use: once the phone is in, hide it
+  if (s.peer === 'connected' && pairTimer) clearPairCode('Phone paired.');
   $('v-phone').textContent = !s.peerPresent ? 'No phone' : s.peer === 'connected' ? 'Phone connected' : 'Phone linking…';
+}
+
+// ---------- pairing code ----------
+
+let pairTimer: ReturnType<typeof setInterval> | null = null;
+
+function showPairCode(code: string, expiresInMs: number): void {
+  const until = Date.now() + expiresInMs;
+  const el = $('v-paircode');
+  el.textContent = `${code.slice(0, 3)} ${code.slice(3)}`;
+  el.hidden = false;
+  if (pairTimer) clearInterval(pairTimer);
+  const tick = () => {
+    const left = Math.max(0, until - Date.now());
+    if (left === 0) {
+      clearPairCode('Code expired. Make a new one if you still need it.');
+      return;
+    }
+    const m = Math.floor(left / 60_000);
+    const s = Math.floor((left % 60_000) / 1000);
+    $('v-paircode-hint').textContent = `Type this on the phone. Valid for ${m}:${String(s).padStart(2, '0')}, works once.`;
+  };
+  tick();
+  pairTimer = setInterval(tick, 1000);
+}
+
+function clearPairCode(hint: string): void {
+  if (pairTimer) clearInterval(pairTimer);
+  pairTimer = null;
+  $('v-paircode').hidden = true;
+  $('v-paircode-hint').textContent = hint;
 }
 
 // ---------- PTT ----------
@@ -327,6 +362,9 @@ function wireUi(): void {
     startLink();
   });
   $('b-kick').addEventListener('click', () => link?.kick());
+  $('b-paircode').addEventListener('click', () => {
+    if (!link?.createPairCode()) clearPairCode('Not connected to the server yet.');
+  });
 
   $('b-cc-browse').addEventListener('click', async () => {
     const res = await pit.browseCrewChief();

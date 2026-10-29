@@ -26,10 +26,19 @@
         <span class="ptt-text" id="ptt-text">TAP TO CONNECT</span>
       </button>
 
+      <form class="tile pair" id="pair" hidden autocomplete="off">
+        <span class="label">Pair with your PC</span>
+        <p class="pair-help">On the PC, click <b>Pairing code</b> under Pair phone, then type the code here.</p>
+        <input id="pair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" aria-label="Pairing code" />
+        <button class="tile flag-purple pair-go" type="submit">PAIR</button>
+        <span class="label" id="pair-msg"></span>
+      </form>
+
       <footer>
         <div id="meter"></div>
         <div class="foot-row">
           <button class="chip" id="nr" type="button" hidden></button>
+          <button class="chip" id="repair" type="button" hidden>Pair again</button>
           <span class="label" id="foot-msg"></span>
           <span class="label" id="fx-status"></span>
         </div>

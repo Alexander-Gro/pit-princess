@@ -672,3 +672,92 @@ describe('access key', () => {
     expect(pc.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
   });
 });
+
+describe('pairing codes', () => {
+  const KEY = 'secret-key-0123456789';
+
+  async function pcWithCode(hub: RoomHub) {
+    const pc = new FakeConn('pc');
+    await hub.handle(pc, { t: 'host', room: ROOM, key: KEY });
+    pc.take();
+    await hub.handle(pc, { t: 'pair_create' });
+    const msg = pc.take()[0] as Extract<ServerMsg, { t: 'pair_code' }>;
+    expect(msg.t).toBe('pair_code');
+    expect(msg.code).toMatch(/^\d{6}$/);
+    return { pc, code: msg.code };
+  }
+
+  it('a valid code hands over the room and access key, once', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { code } = await pcWithCode(hub);
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'pair_claim', code });
+    expect(phone.take()).toEqual([{ t: 'paired', room: ROOM, key: KEY }]);
+    // Single use
+    const other = new FakeConn('other');
+    await hub.handle(other, { t: 'pair_claim', code });
+    expect(other.take()).toEqual([{ t: 'error', code: 'bad_code' }]);
+  });
+
+  it('creating a new code invalidates the old one', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { pc, code } = await pcWithCode(hub);
+    await hub.handle(pc, { t: 'pair_create' });
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'pair_claim', code });
+    const fresh = (pc.take()[0] as Extract<ServerMsg, { t: 'pair_code' }>).code;
+    // (1-in-a-million chance the new random code equals the old one, in which case it's valid)
+    const expected = fresh === code ? { t: 'paired', room: ROOM, key: KEY } : { t: 'error', code: 'bad_code' };
+    expect(phone.take()).toEqual([expected]);
+  });
+
+  it('only the PC can create codes', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    await pcWithCode(hub);
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'join', room: ROOM, key: KEY });
+    phone.take();
+    await hub.handle(phone, { t: 'pair_create' });
+    expect(phone.take()).toEqual([]);
+  });
+
+  it('codes expire', async () => {
+    vi.useFakeTimers();
+    try {
+      const hub = makeHub({ accessKey: KEY });
+      const { code } = await pcWithCode(hub);
+      vi.advanceTimersByTime(10 * 60_000 + 1);
+      const phone = new FakeConn('phone');
+      await hub.handle(phone, { t: 'pair_claim', code });
+      expect(phone.take()).toEqual([{ t: 'error', code: 'bad_code' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a code stops working once the PC has gone', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { pc, code } = await pcWithCode(hub);
+    hub.disconnect(pc);
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'pair_claim', code });
+    expect(phone.take()).toEqual([{ t: 'error', code: 'bad_code' }]);
+  });
+
+  it('limits guesses per connection and server-wide', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { code } = await pcWithCode(hub);
+    const wrong = code === '000000' ? '000001' : '000000';
+    const guesser = new FakeConn('guesser');
+    for (let i = 0; i < 5; i++) await hub.handle(guesser, { t: 'pair_claim', code: wrong });
+    await hub.handle(guesser, { t: 'pair_claim', code });
+    expect(guesser.last()).toEqual({ t: 'error', code: 'rate_limited' });
+    expect(guesser.closed).toBe(1);
+
+    // 25 more failures from fresh connections reach the server-wide cap of 30
+    for (let i = 0; i < 25; i++) await hub.handle(new FakeConn(`g${i}`), { t: 'pair_claim', code: wrong });
+    const late = new FakeConn('late');
+    await hub.handle(late, { t: 'pair_claim', code });
+    expect(late.take()).toEqual([{ t: 'error', code: 'rate_limited' }]);
+  });
+});

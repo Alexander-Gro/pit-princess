@@ -1,7 +1,7 @@
 // Room + floor logic, independent of the transport so it can be tested directly.
 
-import { timingSafeEqual, createHash } from 'node:crypto';
-import { MAX_TX_MS, ROOM_CODE_RE, type ClientMsg, type FloorHolder, type Role, type ServerMsg } from '@pit/shared';
+import { timingSafeEqual, createHash, randomInt } from 'node:crypto';
+import { MAX_TX_MS, PAIR_CODE_RE, PAIR_CODE_TTL_MS, ROOM_CODE_RE, type ClientMsg, type FloorHolder, type Role, type ServerMsg } from '@pit/shared';
 
 export interface Conn {
   send(msg: ServerMsg): void;
@@ -30,6 +30,11 @@ export interface HubOptions {
   accessKey?: string;
 }
 
+/** Wrong pairing codes allowed per connection, and server-wide per window, before refusing */
+const PAIR_TRIES_PER_CONN = 5;
+const PAIR_FAILS_PER_WINDOW = 30;
+const PAIR_FAIL_WINDOW_MS = 10 * 60_000;
+
 const other = (r: Role): Role => (r === 'pc' ? 'phone' : 'pc');
 
 export class RoomHub {
@@ -38,6 +43,10 @@ export class RoomHub {
   /** Connections currently waiting on ICE servers before entering a room */
   private entering = new Map<Conn, { role: Role; code: string }>();
   private opts: Required<HubOptions>;
+  /** pairing code -> room code */
+  private pairCodes = new Map<string, { room: string; expires: number }>();
+  private pairTries = new WeakMap<Conn, number>();
+  private pairFails: number[] = [];
 
   constructor(opts: HubOptions) {
     this.opts = { maxTxMs: MAX_TX_MS, maxRooms: 1000, accessKey: '', ...opts };
@@ -47,6 +56,10 @@ export class RoomHub {
     const msg = parseClientMsg(raw);
     if (!msg) {
       conn.send({ t: 'error', code: 'bad_message' });
+      return;
+    }
+    if (msg.t === 'pair_claim') {
+      this.claimPairCode(conn, msg.code);
       return;
     }
     if (msg.t === 'host' || msg.t === 'join') {
@@ -83,6 +96,17 @@ export class RoomHub {
         if (room.floor === m.role) this.setFloor(room, 'idle');
         break;
       }
+      case 'pair_create': {
+        if (m.role !== 'pc') break;
+        // One live code per room
+        for (const [c, p] of this.pairCodes) if (p.room === room.code) this.pairCodes.delete(c);
+        let code: string;
+        do code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+        while (this.pairCodes.has(code));
+        this.pairCodes.set(code, { room: room.code, expires: Date.now() + PAIR_CODE_TTL_MS });
+        conn.send({ t: 'pair_code', code, expiresInMs: PAIR_CODE_TTL_MS });
+        break;
+      }
       case 'kick': {
         if (m.role !== 'pc' || !room.phone) break;
         const phone = room.phone;
@@ -91,6 +115,32 @@ export class RoomHub {
         break;
       }
     }
+  }
+
+  /**
+   * A phone with no room/key yet trades the 6-digit code shown on the PC for both.
+   * Codes are single-use and expire; guesses are limited per connection and server-wide,
+   * which keeps brute force (1 in a million per guess) out of reach.
+   */
+  private claimPairCode(conn: Conn, code: string): void {
+    const now = Date.now();
+    this.pairFails = this.pairFails.filter((t) => now - t < PAIR_FAIL_WINDOW_MS);
+    const tries = this.pairTries.get(conn) ?? 0;
+    if (tries >= PAIR_TRIES_PER_CONN || this.pairFails.length >= PAIR_FAILS_PER_WINDOW) {
+      conn.send({ t: 'error', code: 'rate_limited' });
+      conn.close();
+      return;
+    }
+    for (const [c, p] of this.pairCodes) if (p.expires <= now) this.pairCodes.delete(c);
+    const entry = PAIR_CODE_RE.test(code) ? this.pairCodes.get(code) : undefined;
+    if (!entry || !this.rooms.get(entry.room)?.pc) {
+      this.pairTries.set(conn, tries + 1);
+      this.pairFails.push(now);
+      conn.send({ t: 'error', code: 'bad_code' });
+      return;
+    }
+    this.pairCodes.delete(code);
+    conn.send({ t: 'paired', room: entry.room, key: this.opts.accessKey });
   }
 
   private keyOk(key: string | undefined): boolean {
@@ -252,7 +302,10 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
     case 'floor_request':
     case 'floor_release':
     case 'kick':
+    case 'pair_create':
       return { t: m.t };
+    case 'pair_claim':
+      return typeof m.code === 'string' && m.code.length <= 16 ? { t: 'pair_claim', code: m.code } : null;
     default:
       return null;
   }
