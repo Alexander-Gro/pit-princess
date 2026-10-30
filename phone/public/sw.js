@@ -13,7 +13,7 @@ self.addEventListener('push', (event) => {
   }
   event.waitUntil(
     self.registration.showNotification(data.title || 'Pit Princess', {
-      body: data.body || 'The PC is online.',
+      body: data.body || 'Someone is on the radio.',
       icon: '/icon-192.png',
       badge: '/icon-192.png',
       // Replace an older "PC online" notification instead of stacking them

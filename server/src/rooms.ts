@@ -36,6 +36,8 @@ interface Member {
   id: MemberId;
   /** Phones: the device id they joined with; the PC uses it to remember names */
   device: string | null;
+  /** Phones: opaque id for the notification directory */
+  pushId: string | null;
   /** Phones: seat number 1..MAX_PHONES, kept while connected */
   slot: number;
   room: Room;
@@ -50,6 +52,8 @@ interface Room {
   names: Record<MemberId, string>;
   floor: FloorHolder;
   floorTimer: ReturnType<typeof setTimeout> | null;
+  /** PC's setting: phones hear each other while the PC is here (phones enforce it) */
+  phonesHear: boolean;
 }
 
 export interface HubOptions {
@@ -62,6 +66,14 @@ export interface HubOptions {
   push?: Pusher | null;
   /** Minimum time between "PC online" notifications for one room */
   announceCooldownMs?: number;
+}
+
+interface Entering {
+  role: Role;
+  code: string;
+  device: string | null;
+  name: string | null;
+  pushId: string | null;
 }
 
 export interface Pusher {
@@ -77,12 +89,18 @@ const PAIR_FAIL_WINDOW_MS = 10 * 60_000;
 const ANNOUNCES_PER_CONN = 3;
 const ANNOUNCES_PER_WINDOW = 30;
 const ANNOUNCE_WINDOW_MS = 60_000;
+/** One ping per room per this long, and a few per connection per minute */
+const PING_COOLDOWN_MS = 30_000;
+const PINGS_PER_CONN_PER_MIN = 3;
 
 export class RoomHub {
   readonly rooms = new Map<string, Room>();
   private members = new Map<Conn, Member>();
   /** Connections currently waiting on ICE servers before entering a room */
-  private entering = new Map<Conn, { role: Role; code: string; device: string | null }>();
+  private entering = new Map<Conn, Entering>();
+  /** room code -> last ping */
+  private lastPing = new Map<string, number>();
+  private pingTimes = new WeakMap<Conn, number[]>();
   private opts: Required<HubOptions>;
   /** pairing code -> room code */
   private pairCodes = new Map<string, { room: string; expires: number }>();
@@ -119,8 +137,12 @@ export class RoomHub {
         conn.close();
         return;
       }
-      const device = msg.t === 'join' && isDeviceId(msg.device) ? msg.device : null;
-      await this.enter(conn, msg.t === 'host' ? 'pc' : 'phone', msg.room, device);
+      const isJoin = msg.t === 'join';
+      await this.enter(conn, isJoin ? 'phone' : 'pc', msg.room, {
+        device: isJoin && isDeviceId(msg.device) ? msg.device : null,
+        name: isJoin ? cleanName(msg.name) : null,
+        pushId: isJoin && isDeviceId(msg.push) ? msg.push : null,
+      });
       return;
     }
     const m = this.members.get(conn);
@@ -131,15 +153,16 @@ export class RoomHub {
     const room = m.room;
     switch (msg.t) {
       case 'signal': {
-        // Phones only ever talk to the PC; the PC says which phone
-        const target = m.role === 'phone' ? room.pc : msg.to ? room.phones.get(msg.to) : undefined;
+        // Everyone links to everyone (PC <-> phones and phone <-> phone), so any member may
+        // signal any other member in the room
+        const target = !msg.to || msg.to === m.id ? undefined : msg.to === PC_ID ? room.pc : room.phones.get(msg.to);
         target?.send({ t: 'signal', from: m.id, cid: msg.cid, data: msg.data });
         break;
       }
       case 'floor_request': {
         if (room.floor === m.id) {
           conn.send({ t: 'floor', holder: m.id });
-        } else if (room.floor !== 'idle' || (m.role === 'phone' ? !room.pc : room.phones.size === 0)) {
+        } else if (room.floor !== 'idle' || this.othersIn(room, m.id) === 0) {
           conn.send({ t: 'busy' });
         } else {
           this.setFloor(room, m.id);
@@ -152,9 +175,24 @@ export class RoomHub {
       }
       case 'names': {
         if (m.role !== 'pc') break;
+        // Merged over the names phones brought along, so a phone the PC hasn't named keeps its own
         const present = new Set([PC_ID, ...room.phones.keys()]);
-        room.names = Object.fromEntries(Object.entries(msg.names).filter(([id]) => present.has(id)));
+        for (const [id, name] of Object.entries(msg.names)) {
+          if (!present.has(id)) continue;
+          if (name === null) delete room.names[id];
+          else room.names[id] = name;
+        }
         this.broadcastRoster(room);
+        break;
+      }
+      case 'room_settings': {
+        if (m.role !== 'pc') break;
+        room.phonesHear = msg.phonesHear;
+        this.broadcastRoster(room);
+        break;
+      }
+      case 'ping': {
+        await this.ping(conn, m, msg.subs);
         break;
       }
       case 'announce': {
@@ -203,11 +241,12 @@ export class RoomHub {
     for (const [c, p] of this.pairCodes) if (p.expires <= now) this.pairCodes.delete(c);
     const entry = PAIR_CODE_RE.test(code) ? this.pairCodes.get(code) : undefined;
     const target = entry ? this.rooms.get(entry.room) : undefined;
-    if (entry && target?.pc && target.phones.size >= MAX_PHONES) {
+    if (entry && target && target.phones.size >= MAX_PHONES) {
       // Valid code, no free seat: keep the code for after a phone is kicked
       conn.send({ t: 'error', code: 'room_full' });
       return;
     }
+    // Pairing stays a PC thing: a code only works while the PC that made it is in the room
     if (!entry || !target?.pc) {
       this.pairTries.set(conn, tries + 1);
       this.pairFails.push(now);
@@ -216,6 +255,48 @@ export class RoomHub {
     }
     this.pairCodes.delete(code);
     conn.send({ t: 'paired', room: entry.room, key: this.opts.accessKey });
+  }
+
+  /**
+   * "Get on the radio": notify the given (absent) phones. Any member may ping; the sender
+   * picks the recipients from its copy of the room's directory. Limited per room and connection,
+   * and it shares the server-wide push budget with announce.
+   */
+  private async ping(conn: Conn, m: Member, subs: PushSub[]): Promise<void> {
+    const now = Date.now();
+    const room = m.room;
+    this.announceTimes = this.announceTimes.filter((t) => now - t < ANNOUNCE_WINDOW_MS);
+    const mine = (this.pingTimes.get(conn) ?? []).filter((t) => now - t < 60_000);
+    const limited =
+      now - (this.lastPing.get(room.code) ?? 0) < PING_COOLDOWN_MS ||
+      mine.length >= PINGS_PER_CONN_PER_MIN ||
+      this.announceTimes.length >= ANNOUNCES_PER_WINDOW;
+    if (!this.opts.push) {
+      conn.send({ t: 'pinged', sent: 0, gone: [], limited: false, unavailable: true });
+      return;
+    }
+    if (subs.length === 0 || limited) {
+      conn.send({ t: 'pinged', sent: 0, gone: [], limited: limited && subs.length > 0 });
+      return;
+    }
+    mine.push(now);
+    this.pingTimes.set(conn, mine);
+    this.announceTimes.push(now);
+    this.lastPing.delete(room.code);
+    this.lastPing.set(room.code, now);
+    if (this.lastPing.size > 1000) this.lastPing.delete(this.lastPing.keys().next().value!);
+    const who = room.names[m.id] ?? (m.role === 'pc' ? 'The PC' : `Phone ${m.slot}`);
+    try {
+      const res = await this.opts.push.send(subs, {
+        title: 'Pit Princess',
+        body: `${who} wants you on the radio. Tap to join.`,
+        tag: 'ping',
+      });
+      conn.send({ t: 'pinged', ...res, limited: false });
+    } catch (e) {
+      console.warn('[push] ping failed', e instanceof Error ? e.message : e);
+      conn.send({ t: 'pinged', sent: 0, gone: [], limited: false });
+    }
   }
 
   /** Tell the room's phones the PC is online, unless a phone is already here. */
@@ -277,14 +358,14 @@ export class RoomHub {
     this.removeMember(conn, null);
   }
 
-  private async enter(conn: Conn, role: Role, code: string, device: string | null): Promise<void> {
+  private async enter(conn: Conn, role: Role, code: string, who: Omit<Entering, 'role' | 'code'>): Promise<void> {
     if (!ROOM_CODE_RE.test(code)) {
       conn.send({ t: 'error', code: 'bad_room' });
       return;
     }
     // A second host/join while the first waits for ICE just updates the target; the latest wins.
     const waiting = this.entering.has(conn);
-    this.entering.set(conn, { role, code, device });
+    this.entering.set(conn, { role, code, ...who });
     if (waiting) return;
     let iceServers: RTCIceServer[];
     try {
@@ -295,7 +376,8 @@ export class RoomHub {
     const target = this.entering.get(conn);
     if (!target) return; // disconnected while waiting
     this.entering.delete(conn);
-    ({ role, code, device } = target);
+    ({ role, code } = target);
+    const { device, name, pushId } = target;
 
     const prev = this.members.get(conn);
     if (prev) {
@@ -316,16 +398,14 @@ export class RoomHub {
 
     let room = this.rooms.get(code);
     if (!room) {
-      // Only the PC creates rooms, so random joins can't fill the table.
-      if (role === 'phone') {
-        conn.send({ t: 'error', code: 'no_host' });
-        return;
-      }
+      // Whoever comes online first opens the room. It takes the room code (and the access
+      // key when the server has one), and maxRooms caps the table.
       if (this.rooms.size >= this.opts.maxRooms) {
-        conn.send({ t: 'error', code: 'bad_room' });
+        // Retryable: a room may free up
+        conn.send({ t: 'error', code: 'server_full' });
         return;
       }
-      room = { code, pc: null, phones: new Map(), names: {}, floor: 'idle', floorTimer: null };
+      room = { code, pc: null, phones: new Map(), names: {}, floor: 'idle', floorTimer: null, phonesHear: true };
       this.rooms.set(code, room);
     }
 
@@ -355,7 +435,9 @@ export class RoomHub {
     }
     if (role === 'pc') room.pc = conn;
     else room.phones.set(id, conn);
-    const member: Member = { conn, role, id, device: role === 'phone' ? device : null, slot, room };
+    const member: Member = { conn, role, id, device: role === 'phone' ? device : null, pushId, slot, room };
+    // A phone brings the name it was given last time; the PC's names override it
+    if (role === 'phone' && name && !room.names[id]) room.names[id] = name;
     this.members.set(conn, member);
 
     conn.send(this.welcome(room, member, iceServers));
@@ -366,7 +448,15 @@ export class RoomHub {
   }
 
   private welcome(room: Room, m: Member, iceServers: RTCIceServer[]): ServerMsg {
-    return { t: 'welcome', role: m.role, you: m.id, iceServers, floor: room.floor, members: this.roster(room, m.role === 'pc') };
+    return {
+      t: 'welcome',
+      role: m.role,
+      you: m.id,
+      iceServers,
+      floor: room.floor,
+      members: this.roster(room, m.role === 'pc'),
+      phonesHear: room.phonesHear,
+    };
   }
 
   /** `forPc` adds phones' device ids, which only the PC needs (to remember names) */
@@ -376,6 +466,7 @@ export class RoomHub {
     for (const [id, c] of room.phones) {
       const m = this.members.get(c);
       const info: MemberInfo = { id, role: 'phone', name: room.names[id] ?? null, slot: m?.slot };
+      if (m?.pushId) info.pushId = m.pushId;
       if (forPc && m?.device) info.device = m.device;
       list.push(info);
     }
@@ -383,9 +474,14 @@ export class RoomHub {
   }
 
   private broadcastRoster(room: Room): void {
-    room.pc?.send({ t: 'roster', members: this.roster(room, true) });
-    const forPhones: ServerMsg = { t: 'roster', members: this.roster(room, false) };
+    room.pc?.send({ t: 'roster', members: this.roster(room, true), phonesHear: room.phonesHear });
+    const forPhones: ServerMsg = { t: 'roster', members: this.roster(room, false), phonesHear: room.phonesHear };
     for (const c of room.phones.values()) c.send(forPhones);
+  }
+
+  /** Members in the room other than `id` (anyone can hear a transmission now: PC or phone) */
+  private othersIn(room: Room, id: MemberId): number {
+    return (room.pc && id !== PC_ID ? 1 : 0) + [...room.phones.keys()].filter((p) => p !== id).length;
   }
 
   private newMemberId(): MemberId {
@@ -410,8 +506,8 @@ export class RoomHub {
     if (m.role === 'pc') room.pc = null;
     else room.phones.delete(m.id);
     delete room.names[m.id];
-    // A phone's transmission needs the PC to hear and relay it, so the PC leaving ends it too
-    if (room.floor === m.id || (m.role === 'pc' && room.floor !== 'idle')) this.setFloor(room, 'idle');
+    // Phones hear each other directly, so only the departing member's own transmission ends
+    if (room.floor === m.id) this.setFloor(room, 'idle');
     if (m.role === 'pc') for (const phone of room.phones.values()) phone.send({ t: 'peer_left', id: PC_ID });
     else room.pc?.send({ t: 'peer_left', id: m.id });
     this.broadcastRoster(room);
@@ -450,8 +546,16 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
       if (m.key !== undefined && typeof m.key !== 'string') return null;
       if (m.v !== undefined && typeof m.v !== 'number') return null;
       if (m.t === 'join') {
-        if (m.device !== undefined && typeof m.device !== 'string') return null;
-        return { t: 'join', v: m.v as number | undefined, room: m.room, key: m.key as string | undefined, device: m.device as string | undefined };
+        for (const k of ['device', 'name', 'push'] as const) if (m[k] !== undefined && typeof m[k] !== 'string') return null;
+        return {
+          t: 'join',
+          v: m.v as number | undefined,
+          room: m.room,
+          key: m.key as string | undefined,
+          device: m.device as string | undefined,
+          name: m.name as string | undefined,
+          push: m.push as string | undefined,
+        };
       }
       return { t: 'host', v: m.v as number | undefined, room: m.room, key: m.key as string | undefined };
     case 'signal': {
@@ -467,6 +571,7 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
       if (d.kind === 'ice' && (d.candidate === null || typeof d.candidate === 'object')) {
         return { t: 'signal', to, cid, data: { kind: 'ice', candidate: d.candidate as RTCIceCandidateInit | null } };
       }
+      if (d.kind === 'restart') return { t: 'signal', to, cid, data: { kind: 'restart' } };
       return null;
     }
     case 'kick':
@@ -476,10 +581,12 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
       if (typeof m.names !== 'object' || m.names === null || Array.isArray(m.names)) return null;
       const entries = Object.entries(m.names as Record<string, unknown>);
       if (entries.length > 1 + MAX_PHONES * 10) return null;
-      const names: Record<MemberId, string> = {};
+      const names: Record<MemberId, string | null> = {};
       for (const [id, v] of entries) {
-        const name = cleanName(v);
-        if (!MEMBER_ID_RE.test(id) || !name) return null;
+        if (!MEMBER_ID_RE.test(id)) return null;
+        // null clears a name
+        const name = v === null ? null : cleanName(v);
+        if (v !== null && !name) return null;
         names[id] = name;
       }
       return { t: 'names', names };
@@ -488,10 +595,14 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
     case 'floor_release':
     case 'pair_create':
       return { t: m.t };
-    case 'announce': {
+    case 'announce':
+    case 'ping': {
       if (!Array.isArray(m.subs) || m.subs.length > MAX_PUSH_SUBS || !m.subs.every(isPushSub)) return null;
-      return { t: 'announce', subs: m.subs.map((s: PushSub) => ({ endpoint: s.endpoint, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } })) };
+      const subs = m.subs.map((s: PushSub) => ({ endpoint: s.endpoint, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } }));
+      return { t: m.t, subs };
     }
+    case 'room_settings':
+      return typeof m.phonesHear === 'boolean' ? { t: 'room_settings', phonesHear: m.phonesHear } : null;
     case 'pair_claim':
       return typeof m.code === 'string' && m.code.length <= 16 ? { t: 'pair_claim', code: m.code } : null;
     default:

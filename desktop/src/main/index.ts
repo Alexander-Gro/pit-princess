@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { Joysticks, matchesBinding } from './joystick';
 import { loadSettings, saveSettings } from './settings';
 import { loadCrewChief, resolveFxFolder } from './crewchief';
-import { MAX_PUSH_SUBS, NOISE_MODES, ROOM_CODE_RE, clampFx, cleanName, isDeviceId, isPushSub } from '@pit/shared';
+import { MAX_DIR_ENTRIES, NOISE_MODES, ROOM_CODE_RE, clampFx, cleanName, isDeviceId, isPushEntry } from '@pit/shared';
 import { MAX_DEVICE_NAMES, type Settings } from '../common/types';
 
 // Dev/test aid: run with a throwaway settings folder
@@ -151,12 +151,8 @@ function sanitizePatch(patch: Partial<Settings>): Partial<Settings> {
     out.micGain = Math.max(0, Math.min(2, patch.micGain));
   }
   if (typeof patch.feedbackSuppression === 'boolean') out.feedbackSuppression = patch.feedbackSuppression;
-  if (
-    Array.isArray(patch.pushSubs) &&
-    patch.pushSubs.length <= MAX_PUSH_SUBS &&
-    patch.pushSubs.every((e) => e && (e.device === null || isDeviceId(e.device)) && isPushSub(e.sub))
-  ) {
-    out.pushSubs = patch.pushSubs.map((e) => ({ device: e.device, sub: e.sub }));
+  if (Array.isArray(patch.pushDir) && patch.pushDir.length <= MAX_DIR_ENTRIES && patch.pushDir.every(isPushEntry)) {
+    out.pushDir = patch.pushDir.map((e) => ({ owner: e.owner, sub: e.sub, ts: e.ts }));
   }
   if (patch.pcName !== undefined) {
     const name = cleanName(patch.pcName);

@@ -9,7 +9,8 @@ import {
   FX_RANGES,
   MAX_PHONES,
   PC_ID,
-  PcMixer,
+  PushDirectory,
+  isDirMsg,
   RadioFx,
   RadioLink,
   RemoteAudio,
@@ -20,15 +21,13 @@ import {
   bytesToB64,
   micConstraints,
   generateRoomCode,
-  isPhoneToPcMsg,
-  MAX_PUSH_SUBS,
   readLevel,
   type CcSoundName,
   type FxFileMsg,
   type LinkState,
 } from '@pit/shared';
 import { createRadioContext, prepareRnnoise } from '@pit/shared/noise';
-import type { CrewChiefResult, JoystickInfo, PitApi, PttBinding, Settings, StoredPushSub } from '../../common/types';
+import type { CrewChiefResult, JoystickInfo, PitApi, PttBinding, Settings } from '../../common/types';
 
 declare global {
   interface Window {
@@ -54,8 +53,8 @@ const ctx = createRadioContext();
 const fx = new RadioFx(ctx);
 /** One audio source per phone, shared by the radio effect (what you hear) and the relay */
 const remotes = new RemoteAudio(ctx);
-/** Builds what each phone hears: your mic plus the other phone, when it's talking */
-const mixer = new PcMixer(ctx);
+/** The room's notification directory, synced with the phones (loaded in boot) */
+let dir = new PushDirectory();
 const txMeter = new RevLights($('m-tx'), 24);
 const rxMeter = new RevLights($('m-rx'), 24);
 
@@ -112,8 +111,6 @@ async function openMic(deviceId: string): Promise<void> {
   tx.setActive(link?.getState().tx ?? false);
   renderNotches(0);
   link?.setMicTrack(tx.track);
-  // The phones get the mic through the mixer; the link still mutes it unless you transmit
-  mixer.setPcTrack(tx.track);
 }
 
 async function applyOutput(deviceId: string): Promise<void> {
@@ -188,42 +185,46 @@ function startLink(): void {
     accessKey: settings.accessKey,
     fx,
     onChange: render,
-    sendTrackFor: (id) => mixer.outputFor(id),
     onRemoteStream: (id, stream) => {
       const node = remotes.set(id, stream);
-      if (node) {
-        fx.addRemote(id, node);
-        mixer.addRemote(id, node);
-      } else {
-        fx.removeRemote(id);
-        mixer.removePhone(id);
-      }
+      if (node) fx.addRemote(id, node);
+      else fx.removeRemote(id);
     },
-    onDataOpen: (id) => sendSoundsToPhone(id),
+    onDataOpen: (id) => {
+      sendSoundsToPhone(id);
+      link?.sendData({ t: 'dir', entries: dir.toJSON() }, id);
+    },
     onPairCode: showPairCode,
     onData: onPhoneMessage,
+    pingTargets: () => dir.absent(link?.getState().members.map((m) => m.pushId) ?? []),
     onWelcome: (members) => {
       sentNames = '';
       sendNames(members);
-      // "PC is online" goes out once per app launch, not on every reconnect
+      link?.setPhonesHear(settings.relayPhones);
+      // "PC is online" goes out once per app launch, not on every reconnect, and only to phones
+      // that aren't already here
       if (announced) return;
-      const here = new Set(members.map((m) => m.device).filter(Boolean));
-      const phonesHere = members.some((m) => m.role === 'phone');
-      // Only phones that aren't already connected; old untagged ones only if nobody is
-      const subs = settings.pushSubs
-        .filter((e) => (e.device ? !here.has(e.device) : !phonesHere))
-        .map((e) => e.sub);
+      const subs = dir.absent(members.map((m) => m.pushId));
       if (!subs.length || link?.announce(subs)) announced = true;
     },
     onRoster: (members) => sendNames(members),
     onAnnounced: (sent, gone) => {
-      if (gone.length) void updatePushSubs((subs) => subs.filter((e) => !gone.includes(e.sub.endpoint)));
+      if (gone.length) forgetEndpoints(gone);
       $('v-push').textContent = sent ? `Notified ${sent} phone${sent > 1 ? 's' : ''} that the PC is online.` : pushHint();
+    },
+    onPinged: (sent, gone, limited, unavailable) => {
+      if (gone.length) forgetEndpoints(gone);
+      $('v-push').textContent = unavailable
+        ? 'Pinging needs notifications set up on the server (VAPID keys).'
+        : limited
+        ? 'Pinged a moment ago. Wait 30 seconds before pinging again.'
+        : sent
+          ? `Pinged ${sent} phone${sent > 1 ? 's' : ''}.`
+          : 'Nobody to ping: every phone with alerts on is already here.';
     },
   });
   const track = tx?.track ?? null;
   link.setMicTrack(track);
-  mixer.setPcTrack(track);
   lastPeer = 'none';
   link.start();
   render(link.getState());
@@ -253,11 +254,10 @@ let lastPeer: LinkState['peer'] = 'none';
 
 function render(s: LinkState): void {
   // PTT held while the link (re)connected: key up once the phone is reachable
-  if (s.peer === 'connected' && lastPeer !== 'connected' && pttSources.size) link?.pttDown();
+  if (s.peer === 'connected' && lastPeer !== 'connected' && pttSources.size) link?.pttDown(true);
   lastPeer = s.peer;
   tx?.setActive(s.tx);
 
-  mixer.setFloor(s.floor);
   const phones = s.members.filter((m) => m.role === 'phone');
   const connected = s.peers.filter((p) => p.status === 'connected').length;
   if (s.error && s.signaling === 'closed') {
@@ -363,10 +363,10 @@ let sentNames = '';
 
 /** Tell the server the names to show on the phones (by member id), when they change. */
 function sendNames(members: MemberInfo[]): void {
-  const names: Record<string, string> = { [PC_ID]: settings.pcName };
+  const names: Record<string, string | null> = { [PC_ID]: settings.pcName };
   for (const m of members) {
-    const n = m.role === 'phone' && m.device ? settings.deviceNames[m.device] : undefined;
-    if (n) names[m.id] = n;
+    // null clears a name, so renaming a phone back to blank sticks
+    if (m.role === 'phone' && m.device) names[m.id] = settings.deviceNames[m.device] ?? null;
   }
   const json = JSON.stringify(names);
   if (json === sentNames) return;
@@ -379,43 +379,37 @@ function sendNames(members: MemberInfo[]): void {
 let announced = false;
 
 function pushHint(): string {
-  const n = settings.pushSubs.length;
-  return n ? `"PC online" alerts: ${n} phone${n > 1 ? 's' : ''}.` : '';
+  const n = dir.liveCount();
+  const alerts = n ? `"PC online" alerts: ${n} phone${n > 1 ? 's' : ''}. ` : '';
+  return `${alerts}Press your talk button 3 times quickly to ping phones that aren't on.`;
 }
 
 let pushSave: Promise<void> = Promise.resolve();
 
-/**
- * Change the stored subscriptions. Updates are chained, and each one starts from the result of
- * the previous, so overlapping changes (a new phone + an expired one) can't overwrite each other.
- */
-function updatePushSubs(change: (subs: StoredPushSub[]) => StoredPushSub[]): Promise<void> {
+/** Save the directory (chained, so overlapping changes can't overwrite each other). */
+function saveDir(): Promise<void> {
   pushSave = pushSave
     .then(async () => {
-      settings = await pit.setSettings({ pushSubs: change(settings.pushSubs) });
+      settings = await pit.setSettings({ pushDir: dir.toJSON() });
       $('v-push').textContent = pushHint();
     })
     .catch((e) => console.warn('[push] save failed', e));
   return pushSave;
 }
 
-function onPhoneMessage(msg: unknown, from: string): void {
-  if (!isPhoneToPcMsg(msg)) return;
-  // Which device sent it, so "PC online" can skip phones that are already connected
-  const device = link?.getState().members.find((m) => m.id === from)?.device ?? null;
-  if (msg.t === 'push_sub') {
-    const sub = msg.sub;
-    // Newest first, one entry per device; drop the oldest beyond the limit
-    void updatePushSubs((subs) =>
-      [{ device, sub }, ...subs.filter((e) => e.sub.endpoint !== sub.endpoint && (!device || e.device !== device))].slice(
-        0,
-        MAX_PUSH_SUBS,
-      ),
-    );
-  } else {
-    const endpoint = msg.endpoint;
-    void updatePushSubs((subs) => subs.filter((e) => e.sub.endpoint !== endpoint));
-  }
+/** Changes spread to every phone, so everyone's copy stays current. */
+function dirChanged(): void {
+  void saveDir();
+  link?.sendData({ t: 'dir', entries: dir.toJSON() });
+}
+
+/** The push service says these endpoints are gone: mark them off for everyone. */
+function forgetEndpoints(endpoints: string[]): void {
+  if (dir.dropEndpoints(endpoints)) dirChanged();
+}
+
+function onPhoneMessage(msg: unknown): void {
+  if (isDirMsg(msg) && dir.merge(msg.entries)) dirChanged();
 }
 
 // ---------- pairing code ----------
@@ -547,7 +541,8 @@ function wireUi(): void {
     link?.kick();
     // A new code shuts out the old phone, so stop notifying it too
     settings = await pit.setSettings({ room: generateRoomCode() });
-    await updatePushSubs(() => []);
+    dir = new PushDirectory();
+    await saveDir();
     startLink();
   });
   const pcName = $<HTMLInputElement>('i-pcname');
@@ -562,10 +557,9 @@ function wireUi(): void {
   });
   const relay = $<HTMLInputElement>('c-relay');
   relay.checked = settings.relayPhones;
-  mixer.setRelayEnabled(settings.relayPhones);
   relay.addEventListener('change', async () => {
     settings = await pit.setSettings({ relayPhones: relay.checked });
-    mixer.setRelayEnabled(relay.checked);
+    link?.setPhonesHear(relay.checked);
   });
   $('b-paircode').addEventListener('click', () => {
     if (!link?.createPairCode()) clearPairCode('Not connected to the server yet.');
@@ -711,6 +705,7 @@ async function boot(): Promise<void> {
   await populateDevices();
   joys = await pit.listJoysticks();
   renderBinding();
+  dir = new PushDirectory(settings.pushDir);
   $('v-push').textContent = pushHint();
   startLink();
   await applyCrewChief(await pit.loadCrewChief());

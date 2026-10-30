@@ -98,6 +98,7 @@ export class RadioFx {
   private outEl: HTMLAudioElement | null = null;
   /** Remote voices (from RemoteAudio), summed into the voice chain */
   private remotes = new Map<string, AudioNode>();
+  private mutedRemotes = new Set<string>();
   private sounds = new Map<CcSoundName, AudioBuffer>();
   private settings: RadioFxSettings = { ...DEFAULT_FX };
   private open = false;
@@ -277,8 +278,23 @@ export class RadioFx {
   /** Add a remote voice (a node from RemoteAudio). Several can play at once; the gate opens on floor. */
   addRemote(id: string, node: AudioNode): void {
     this.removeRemote(id);
+    this.mutedRemotes.delete(id);
     node.connect(this.voiceIn);
     this.remotes.set(id, node);
+  }
+
+  /** Mute or unmute one remote voice (e.g. the other phone, when the PC says phones shouldn't hear each other). */
+  setRemoteMuted(id: string, muted: boolean): void {
+    const node = this.remotes.get(id);
+    if (!node || this.mutedRemotes.has(id) === muted) return;
+    if (muted) this.mutedRemotes.add(id);
+    else this.mutedRemotes.delete(id);
+    try {
+      node.disconnect(this.voiceIn);
+    } catch {
+      /* wasn't connected */
+    }
+    if (!muted) node.connect(this.voiceIn);
   }
 
   removeRemote(id: string): void {
@@ -355,6 +371,17 @@ export class RadioFx {
         this.tone(660, t, 0.05, 0.12);
         break;
     }
+  }
+
+  /** Soft tick: a press with nobody to talk to (it may be part of a ping). */
+  playTick(): void {
+    this.tone(1500, this.ctx.currentTime, 0.025, 0.08);
+  }
+
+  /** "Ping sent": a quick rising triple chirp. */
+  playPingSent(): void {
+    const t = this.ctx.currentTime;
+    [988, 1319, 1760].forEach((f, i) => this.tone(f, t + i * 0.08, 0.06, 0.16));
   }
 
   /** "Channel busy": three short low beeps. */

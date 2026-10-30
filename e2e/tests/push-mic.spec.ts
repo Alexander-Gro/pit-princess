@@ -157,44 +157,76 @@ test.describe('mic is opened once per launch', () => {
   });
 });
 
-test.describe('push subscription reaches the PC over the data channel', () => {
-  test('an existing subscription is sent on connect, once, and passes isPhoneToPcMsg', async ({ context }) => {
-    const { pc } = await openPair(context, { permission: 'granted', subscribed: true });
-    await expect.poll(() => pcData(pc)).toEqual([{ msg: { t: 'push_sub', sub: FAKE_SUB }, valid: true }]);
-    // onDataOpen fires at most once per channel, so no duplicate push_sub arrives later
+// v3: the phone no longer sends push_sub/push_unsub; it puts its own entry {owner: pushId, sub, ts}
+// into the room's directory and shares the whole directory as {t:'dir', entries}.
+type DirEntry = { owner: string; sub: typeof FAKE_SUB | null; ts: number };
+const dirMsgs = async (pc: Page) =>
+  (await pcData(pc)).filter((d) => (d.msg as { t?: string }).t === 'dir') as { msg: { t: 'dir'; entries: DirEntry[] }; valid: boolean }[];
+/** The newest entry for `owner` the PC has been sent */
+const lastEntry = async (pc: Page, owner: string) =>
+  (await dirMsgs(pc)).flatMap((d) => d.msg.entries).filter((e) => e.owner === owner).sort((a, b) => b.ts - a.ts)[0] ?? null;
+const pushIdOf = (phone: Page) => phone.evaluate(() => localStorage.getItem('pit-princess-push-id'));
+
+test.describe('push subscription reaches the PC over the data channel (as the directory)', () => {
+  test('an existing subscription is shared on connect as our own dir entry; every message passes isDirMsg', async ({ context }) => {
+    const { pc, phone } = await openPair(context, { permission: 'granted', subscribed: true, fakeVapid: true });
+    const owner = (await pushIdOf(phone))!;
+    expect(owner).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+    await expect.poll(async () => (await lastEntry(pc, owner))?.sub ?? null).toEqual(FAKE_SUB);
     await pc.waitForTimeout(1000);
-    expect(await pcData(pc)).toHaveLength(1);
+    const msgs = await dirMsgs(pc);
+    expect(msgs.every((m) => m.valid)).toBe(true);
+    // Our entry stays the same (not re-stamped on every message)
+    expect(new Set(msgs.flatMap((m) => m.msg.entries).filter((e) => e.owner === owner).map((e) => e.ts)).size).toBe(1);
     expect(await pc.evaluate(() => window.pit.dataOpenCount)).toBe(1);
+    // The roster carries the same push id, so the PC can tell this phone is present
+    expect((await pc.evaluate(() => window.pit.state!.members)).find((m) => m.role === 'phone')?.pushId).toBe(owner);
+    // ...and it's stored on the phone, keyed by room
+    const stored = await phone.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('pit-princess-dir:')));
+    expect(stored).toHaveLength(1);
   });
 
-  test('without notification permission nothing is sent', async ({ context }) => {
-    const { pc } = await openPair(context, { permission: 'denied', subscribed: true });
+  test('without notification permission no live entry is shared', async ({ context }) => {
+    const { pc, phone } = await openPair(context, { permission: 'denied', subscribed: true, fakeVapid: true });
+    await expect.poll(async () => (await dirMsgs(pc)).length).toBeGreaterThan(0);
     await pc.waitForTimeout(1500);
-    expect(await pcData(pc)).toEqual([]);
+    const owner = (await pushIdOf(phone))!;
+    expect(await lastEntry(pc, owner)).toBeNull();
+    expect((await dirMsgs(pc)).flatMap((d) => d.msg.entries).filter((e) => e.sub)).toEqual([]);
   });
 
-  test('tapping the chip subscribes and sends push_sub; tapping again sends push_unsub', async ({ context }) => {
+  test('tapping the chip subscribes (live entry); tapping again turns it off (newer tombstone)', async ({ context }) => {
     const { pc, phone } = await openPair(context, { permission: 'default', subscribed: false, fakeVapid: true });
+    const owner = (await pushIdOf(phone))!;
     const chip = phone.locator('#notify');
     await expect(chip).toBeVisible();
     await expect(chip).toHaveText('Notify me when PC is online');
-    expect(await pcData(pc)).toEqual([]);
+    expect(await lastEntry(pc, owner)).toBeNull();
 
     await chip.click();
-    await expect.poll(() => pcData(pc)).toEqual([{ msg: { t: 'push_sub', sub: FAKE_SUB }, valid: true }]);
+    await expect.poll(async () => (await lastEntry(pc, owner))?.sub ?? null).toEqual(FAKE_SUB);
+    const on = (await lastEntry(pc, owner))!;
     await expect(chip).toHaveText('PC alerts: on ✓');
     expect(await phone.evaluate(() => (window as unknown as { __subscribeCalls: number }).__subscribeCalls)).toBe(1);
 
     phone.once('dialog', (d) => void d.accept());
     await chip.click();
-    await expect
-      .poll(() => pcData(pc))
-      .toEqual([
-        { msg: { t: 'push_sub', sub: FAKE_SUB }, valid: true },
-        { msg: { t: 'push_unsub', endpoint: FAKE_SUB.endpoint }, valid: true },
-      ]);
+    await expect.poll(async () => { const e = await lastEntry(pc, owner); return e ? e.sub : 'missing'; }).toBeNull();
+    expect((await lastEntry(pc, owner))!.ts).toBeGreaterThan(on.ts);
+    expect((await dirMsgs(pc)).every((m) => m.valid)).toBe(true);
     await expect(chip).toHaveText('Notify me when PC is online');
     expect(await phone.evaluate(() => (window as unknown as { __unsubscribed: number }).__unsubscribed)).toBe(1);
+  });
+
+  test('the PC pings through the real server: no VAPID keys -> pinged {unavailable}', async ({ context }) => {
+    const room = `e2e_${randomBytes(12).toString('hex')}`;
+    const pc = await context.newPage();
+    logConsole('pc', pc);
+    await pc.goto(`${HARNESS}/pc.html?ws=${encodeURIComponent(WS)}&room=${room}`);
+    await expect.poll(async () => (await pcState(pc))?.signaling).toBe('open');
+    await pc.evaluate((s) => (window.pit.targets = [s]), FAKE_SUB);
+    expect(await pc.evaluate(() => window.pit.ping())).toBe(true);
+    await expect.poll(() => pc.evaluate(() => window.pit.pinged)).toEqual([{ sent: 0, gone: [], limited: false, unavailable: true }]);
   });
 
   test('PC announce round-trips through the real server (no VAPID keys: nothing sent)', async ({ context }) => {

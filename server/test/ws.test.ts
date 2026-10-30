@@ -135,12 +135,12 @@ describe('real server over WebSocket', () => {
     const phone = new Client();
     await Promise.all([pc.open(), phone.open()]);
 
-    pc.send({ t: 'host', v: 2, room: ROOM });
+    pc.send({ t: 'host', v: 3, room: ROOM });
     const w1 = await pc.next('welcome');
     expect(w1).toMatchObject({ role: 'pc', you: 'pc', floor: 'idle', members: [{ id: 'pc', role: 'pc', name: null }] });
     expect(Array.isArray(w1.iceServers) && w1.iceServers.length).toBeTruthy();
 
-    phone.send({ t: 'join', v: 2, room: ROOM, device: DEV_A });
+    phone.send({ t: 'join', v: 3, room: ROOM, device: DEV_A });
     const w2 = await phone.next('welcome');
     expect(w2).toMatchObject({ role: 'phone', floor: 'idle' });
     const id = w2.you;
@@ -155,9 +155,9 @@ describe('real server over WebSocket', () => {
     // signaling relay, with cid passed through and from set by the server (a spoofed from is ignored)
     pc.send({ t: 'signal', to: id, cid: 'cid-0001', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
     expect(await phone.next('signal')).toEqual({ t: 'signal', from: 'pc', cid: 'cid-0001', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
-    phone.send({ t: 'signal', from: 'pc', cid: 'cid-0001', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
+    phone.send({ t: 'signal', to: 'pc', from: 'pc', cid: 'cid-0001', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
     expect(await pc.next('signal')).toEqual({ t: 'signal', from: id, cid: 'cid-0001', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
-    phone.send({ t: 'signal', cid: 'cid-0001', data: { kind: 'ice', candidate: null } });
+    phone.send({ t: 'signal', to: 'pc', cid: 'cid-0001', data: { kind: 'ice', candidate: null } });
     expect(await pc.next('signal')).toEqual({ t: 'signal', from: id, cid: 'cid-0001', data: { kind: 'ice', candidate: null } });
 
     // floor
@@ -189,7 +189,7 @@ describe('real server over WebSocket', () => {
     // a new phone rejoins; PC still holds the floor
     const phone2 = new Client();
     await phone2.open();
-    phone2.send({ t: 'join', v: 2, room: ROOM, device: DEV_B });
+    phone2.send({ t: 'join', v: 3, room: ROOM, device: DEV_B });
     expect(await phone2.next('welcome')).toMatchObject({ floor: 'pc' });
     await pc.next('peer_joined');
     pc.close();
@@ -204,14 +204,14 @@ describe('real server over WebSocket', () => {
     const a = new Client();
     const b = new Client();
     await Promise.all([pc.open(), a.open(), b.open()]);
-    pc.send({ t: 'host', v: 2, room });
+    pc.send({ t: 'host', v: 3, room });
     await pc.next('welcome');
-    a.send({ t: 'join', v: 2, room, device: DEV_A });
+    a.send({ t: 'join', v: 3, room, device: DEV_A });
     const oldId = (await a.next('welcome')).you;
     await pc.next('peer_joined');
     a.send({ t: 'floor_request' });
     await pc.next('floor');
-    b.send({ t: 'join', v: 2, room, device: DEV_A });
+    b.send({ t: 'join', v: 3, room, device: DEV_A });
     const newId = (await b.next('welcome')).you;
     expect(newId).not.toBe(oldId);
     expect(await a.next('kicked')).toEqual({ t: 'kicked', reason: 'replaced' });
@@ -230,28 +230,30 @@ describe('real server over WebSocket', () => {
     const b = new Client();
     const c = new Client();
     await Promise.all([pc.open(), a.open(), b.open(), c.open()]);
-    pc.send({ t: 'host', v: 2, room });
+    pc.send({ t: 'host', v: 3, room });
     await pc.next('welcome');
-    a.send({ t: 'join', v: 2, room, device: DEV_A });
+    a.send({ t: 'join', v: 3, room, device: DEV_A });
     const aId = (await a.next('welcome')).you;
-    b.send({ t: 'join', v: 2, room, device: DEV_B });
+    b.send({ t: 'join', v: 3, room, device: DEV_B });
     const bw = await b.next('welcome');
     expect(bw.members.map((m) => m.slot ?? 0)).toEqual([0, 1, 2]);
-    c.send({ t: 'join', v: 2, room, device: DEV_C });
+    c.send({ t: 'join', v: 3, room, device: DEV_C });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'room_full' });
     await settle();
     expect(c.ws.readyState).toBe(WebSocket.OPEN);
     // Phones never see device ids
     expect(JSON.stringify([...a.msgs, ...b.msgs, bw])).not.toMatch(/devA|devB|devC/);
-    // A phone's signal reaches the PC tagged with its id, even when it names the other phone as `to`
-    a.send({ t: 'signal', to: bw.you, cid: 'cid-0002', data: { kind: 'answer', sdp: 'x' } });
-    expect(await pc.next('signal')).toMatchObject({ from: aId, cid: 'cid-0002' });
+    // v3 full mesh: a phone's signal goes to whoever `to` names (here the other phone), tagged with its id
+    a.send({ t: 'signal', to: bw.you, cid: 'cid-0002', data: { kind: 'offer', sdp: 'x' } });
+    expect(await b.next('signal')).toEqual({ t: 'signal', from: aId, cid: 'cid-0002', data: { kind: 'offer', sdp: 'x' } });
+    a.send({ t: 'signal', to: 'pc', cid: 'cid-0003', data: { kind: 'restart' } });
+    expect(await pc.next('signal')).toEqual({ t: 'signal', from: aId, cid: 'cid-0003', data: { kind: 'restart' } });
     pc.send({ t: 'kick', id: aId });
     await a.closed;
-    c.send({ t: 'join', v: 2, room, device: DEV_C });
+    c.send({ t: 'join', v: 3, room, device: DEV_C });
     const cw = await c.next('welcome');
     expect(cw.members.find((m) => m.id === cw.you)?.slot).toBe(1);
-    expect(b.msgs.filter((m) => m.t === 'signal')).toEqual([]);
+    expect(pc.msgs.filter((m) => m.t === 'signal')).toEqual([]);
     for (const x of [pc, b, c]) x.close();
   });
 
@@ -268,7 +270,44 @@ describe('real server over WebSocket', () => {
     await c.open();
     c.send('not json');
     expect(await c.next('error')).toEqual({ t: 'error', code: 'bad_message' });
-    c.send({ t: 'join', v: 2, room: 'short' });
+    c.send({ t: 'join', v: 2, room: ROOM });
+    expect(await c.next('error')).toEqual({ t: 'error', code: 'update_required' });
+    await c.closed;
+    const c2 = new Client();
+    await c2.open();
+    c2.send({ t: 'join', v: 3, room: 'short' });
+    expect(await c2.next('error')).toEqual({ t: 'error', code: 'bad_room' });
+    c2.send({ t: 'floor_request' });
+    expect(await c2.next('error')).toEqual({ t: 'error', code: 'not_in_room' });
+    c2.close();
+  });
+
+  it('v3: two phones with no PC: the first creates the room, the second joins, floor and signals flow', async () => {
+    const room = 'wsPhonesOnly_0123456789';
+    const a = new Client();
+    const b = new Client();
+    await Promise.all([a.open(), b.open()]);
+    a.send({ t: 'join', v: 3, room, device: DEV_A, name: 'Emma', push: 'pushAAAAAAAAAAAAAAAAAA' });
+    const wa = await a.next('welcome');
+    expect(wa).toMatchObject({ role: 'phone', phonesHear: true, members: [{ role: 'phone', name: 'Emma', slot: 1, pushId: 'pushAAAAAAAAAAAAAAAAAA' }] });
+    b.send({ t: 'join', v: 3, room, device: DEV_B });
+    const wb = await b.next('welcome');
+    expect(wb.members.map((m) => m.id)).toEqual([wa.you, wb.you]);
+    await waitFor(a, (m) => m.t === 'roster' && m.members.length === 2);
+    b.send({ t: 'floor_request' });
+    expect(await a.next('floor')).toEqual({ t: 'floor', holder: wb.you });
+    b.send({ t: 'signal', to: wa.you, cid: 'cid-0009', data: { kind: 'answer', sdp: 'y' } });
+    expect(await a.next('signal')).toEqual({ t: 'signal', from: wb.you, cid: 'cid-0009', data: { kind: 'answer', sdp: 'y' } });
+    a.send({ t: 'ping', subs: [] });
+    expect(await a.next('pinged')).toEqual({ t: 'pinged', sent: 0, gone: [], limited: false, unavailable: true });
+    a.close();
+    b.close();
+  });
+
+  it('rejects a bad room code', async () => {
+    const c = new Client();
+    await c.open();
+    c.send({ t: 'join', v: 3, room: 'short' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'bad_room' });
     c.send({ t: 'floor_request' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'not_in_room' });

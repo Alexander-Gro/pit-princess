@@ -1,15 +1,17 @@
 // "Notify me when the PC is online": Web Push for the phone.
 //
-// The phone subscribes once (iOS only allows this in a home-screen app, from a tap) and hands
-// the subscription to the PC over the data channel. The PC keeps it and, when it comes online,
-// asks the server to send the notification. The server stores nothing.
+// The phone subscribes once (iOS only allows this in a home-screen app, from a tap) and puts the
+// subscription in the room's directory, which every device keeps a copy of and syncs over the
+// data channels. Whoever is online can then notify it ("PC is online", or a triple-press ping).
+// The server stores nothing.
 
-import type { PhoneToPcMsg, PushSub, RadioLink } from '@pit/shared';
+import type { PushSub } from '@pit/shared';
 
 let vapidKey: string | null = null;
 let registration: ServiceWorkerRegistration | null = null;
 let chip: HTMLButtonElement | null = null;
-let getLink: () => RadioLink | null = () => null;
+/** Publishes our subscription (or null: off) to the room's directory */
+let setOwn: (sub: PushSub | null) => void = () => {};
 
 // Register the service worker early so it's active by the time the user taps the chip
 const ready: Promise<void> = (async () => {
@@ -52,10 +54,6 @@ function toPushSub(sub: PushSubscription): PushSub | null {
   return { endpoint: j.endpoint, keys: { p256dh: j.keys.p256dh, auth: j.keys.auth } };
 }
 
-function send(msg: PhoneToPcMsg): boolean {
-  return getLink()?.sendData(msg) ?? false;
-}
-
 async function currentSub(): Promise<PushSubscription | null> {
   return registration ? registration.pushManager.getSubscription() : null;
 }
@@ -73,7 +71,7 @@ function keyMatches(sub: PushSubscription): boolean {
 async function usableSub(): Promise<PushSubscription | null> {
   const sub = await currentSub().catch(() => null);
   if (!sub || keyMatches(sub)) return sub;
-  send({ t: 'push_unsub', endpoint: sub.endpoint });
+  setOwn(null);
   await sub.unsubscribe().catch(() => {});
   return null;
 }
@@ -91,13 +89,33 @@ async function render(): Promise<void> {
   else chip.textContent = (await usableSub()) ? 'PC alerts: on ✓' : 'Notify me when PC is online';
 }
 
-/** Send our existing subscription (if any) to the PC. Safe to call on every connection. */
-export async function sendSubscriptionToPc(link: RadioLink | null): Promise<void> {
+/** Make sure the directory has our current subscription (or "off"). Safe to call any time. */
+export async function syncOwnEntry(): Promise<void> {
   await ready;
+  if (!supported()) return;
   const sub = await usableSub();
-  const ps = sub && toPushSub(sub);
-  if (ps && Notification.permission === 'granted') link?.sendData({ t: 'push_sub', sub: ps } satisfies PhoneToPcMsg);
+  const ps = sub && Notification.permission === 'granted' ? toPushSub(sub) : null;
+  setOwn(ps);
   void render();
+}
+
+/**
+ * Our subscription was reported gone by the push service: drop it and make a fresh one (no prompt:
+ * permission is already granted). Returns the new subscription, or null if that isn't possible.
+ */
+export async function renewSubscription(): Promise<PushSub | null> {
+  await ready;
+  if (!registration || !vapidKey || Notification.permission !== 'granted') return null;
+  try {
+    await (await currentSub())?.unsubscribe();
+    const sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlToBytes(vapidKey) });
+    void render();
+    return toPushSub(sub);
+  } catch (e) {
+    console.warn('[push] renew failed', e);
+    void render();
+    return null;
+  }
 }
 
 /** Called synchronously from the tap. */
@@ -112,7 +130,7 @@ function toggle(): Promise<void> {
     const existing = await usableSub();
     if (!existing) return subscribe();
     if (!confirm('Stop notifications when the PC comes online?')) return;
-    send({ t: 'push_unsub', endpoint: existing.endpoint });
+    setOwn(null);
     await existing.unsubscribe().catch(() => {});
     await render();
   })();
@@ -126,15 +144,12 @@ async function subscribe(): Promise<void> {
     applicationServerKey: b64urlToBytes(vapidKey),
   });
   const ps = toPushSub(sub);
-  if (ps && !send({ t: 'push_sub', sub: ps })) {
-    chip.textContent = 'Saved. Connect to the PC once to finish';
-    return;
-  }
+  if (ps) setOwn(ps);
   await render();
 }
 
-export function initPush(linkGetter: () => RadioLink | null, el: HTMLButtonElement): void {
-  getLink = linkGetter;
+export function initPush(publish: (sub: PushSub | null) => void, el: HTMLButtonElement): void {
+  setOwn = publish;
   chip = el;
   el.addEventListener('click', () => {
     void toggle().catch((e) => {

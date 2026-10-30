@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MAX_PHONES, PROTOCOL_VERSION, isPhoneToPcMsg, isPushEndpoint, isPushSub, type MemberInfo, type ServerMsg } from '@pit/shared';
+import { MAX_PHONES, PROTOCOL_VERSION, isDirMsg, isPushEndpoint, isPushEntry, isPushSub, type MemberInfo, type ServerMsg } from '@pit/shared';
 import { RoomHub, type Conn } from '../src/rooms.ts';
 
 const ROOM = 'room-AAAAAAAAAAAAAAAA';
@@ -94,8 +94,8 @@ describe('host / join', () => {
     const pc = new FakeConn('pc');
     await host(hub, pc);
     expect(pc.take()).toEqual([
-      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo()] },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo()], phonesHear: true },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
     ]);
     expect(hub.rooms.has(ROOM)).toBe(true);
   });
@@ -112,12 +112,12 @@ describe('host / join', () => {
     expect(id).not.toBe(DEV_A);
     const forPhone = [pcInfo(), phoneForPhones(phone, 1)];
     expect(phone.take()).toEqual([
-      { t: 'welcome', role: 'phone', you: id, iceServers: ICE, floor: 'idle', members: forPhone },
-      { t: 'roster', members: forPhone },
+      { t: 'welcome', role: 'phone', you: id, iceServers: ICE, floor: 'idle', members: forPhone, phonesHear: true },
+      { t: 'roster', members: forPhone, phonesHear: true },
     ]);
     expect(pc.take()).toEqual([
       { t: 'peer_joined', id },
-      { t: 'roster', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)], phonesHear: true },
     ]);
   });
 
@@ -147,24 +147,29 @@ describe('host / join', () => {
     expect(phone.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
   });
 
-  it('join on a room with no host -> no_host, and no room is created', async () => {
+  it('v3: a phone joining a missing room creates it (no no_host any more)', async () => {
     const hub = makeHub();
     const phone = new FakeConn('phone');
     await join(hub, phone, DEV_A);
-    expect(phone.take()).toEqual([{ t: 'error', code: 'no_host' }]);
-    expect(hub.rooms.size).toBe(0);
-    // Not a member: room messages are refused
-    await hub.handle(phone, { t: 'floor_request' });
-    expect(phone.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+    const forPhone = [phoneForPhones(phone, 1)];
+    expect(phone.take()).toEqual([
+      { t: 'welcome', role: 'phone', you: phone.id, iceServers: ICE, floor: 'idle', members: forPhone, phonesHear: true },
+      { t: 'roster', members: forPhone, phonesHear: true },
+    ]);
+    expect(hub.rooms.size).toBe(1);
+    expect(room(hub)?.pc).toBeNull();
   });
 
-  it('join is refused with no_host even when maxRooms is reached (no room table growth)', async () => {
+  it('v3: at maxRooms, a join for a new room gets server_full (retryable) and no room is created', async () => {
     const hub = makeHub({ maxRooms: 1 });
     await host(hub, new FakeConn('pc'));
     const phone = new FakeConn('phone');
     await join(hub, phone, DEV_A, ROOM2);
-    expect(phone.take()).toEqual([{ t: 'error', code: 'no_host' }]);
+    expect(phone.take()).toEqual([{ t: 'error', code: 'server_full' }]);
+    expect(phone.closed).toBe(0);
     expect(hub.rooms.size).toBe(1);
+    await hub.handle(phone, { t: 'floor_request' });
+    expect(phone.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
   });
 
   it('phone stays in the room after the PC leaves; a returning PC sees it and it gets peer_joined {id: pc}', async () => {
@@ -172,19 +177,19 @@ describe('host / join', () => {
     hub.disconnect(pc);
     expect(phone.take()).toEqual([
       { t: 'peer_left', id: 'pc' },
-      { t: 'roster', members: [phoneForPhones(phone, 1)] },
+      { t: 'roster', members: [phoneForPhones(phone, 1)], phonesHear: true },
     ]);
     expect(room(hub)?.phones.size).toBe(1);
     expect(room(hub)?.pc).toBeNull();
     const pc2 = new FakeConn('pc2');
     await host(hub, pc2);
     expect(pc2.take()).toEqual([
-      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)] },
-      { t: 'roster', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)] },
+      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)], phonesHear: true },
+      { t: 'roster', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)], phonesHear: true },
     ]);
     expect(phone.take()).toEqual([
       { t: 'peer_joined', id: 'pc' },
-      { t: 'roster', members: [pcInfo(), phoneForPhones(phone, 1)] },
+      { t: 'roster', members: [pcInfo(), phoneForPhones(phone, 1)], phonesHear: true },
     ]);
   });
 
@@ -203,7 +208,7 @@ describe('host / join', () => {
     hub.disconnect(phone);
     expect(pc.take()).toEqual([
       { t: 'peer_left', id },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
     ]);
     expect(hub.rooms.has(ROOM)).toBe(true);
     hub.disconnect(pc);
@@ -222,7 +227,7 @@ describe('host / join', () => {
     const { hub, pc, phone } = await setup();
     await host(hub, pc);
     expect(pc.take()).toEqual([
-      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)] },
+      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPc(phone, 1, DEV_A)], phonesHear: true },
     ]);
     expect(phone.take()).toEqual([]);
   });
@@ -232,7 +237,7 @@ describe('host / join', () => {
     const id = phone.id;
     await join(hub, phone, DEV_A);
     expect(phone.take()).toEqual([
-      { t: 'welcome', role: 'phone', you: id, iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPhones(phone, 1)] },
+      { t: 'welcome', role: 'phone', you: id, iceServers: ICE, floor: 'idle', members: [pcInfo(), phoneForPhones(phone, 1)], phonesHear: true },
     ]);
     expect(pc.take()).toEqual([]);
   });
@@ -242,7 +247,8 @@ describe('protocol version', () => {
   it.each([
     ['missing', undefined],
     ['1', 1],
-    ['3', 3],
+    ['2 (before full mesh)', 2],
+    ['4', 4],
     ['0', 0],
   ])('host and join with v %s -> update_required, and the connection is closed', async (_label, v) => {
     const hub = makeHub();
@@ -380,14 +386,23 @@ describe('invalid input', () => {
     expect(c.take()).toEqual(Array(msgs.length).fill({ t: 'error', code: 'not_in_room' }));
   });
 
-  it('maxRooms is enforced', async () => {
+  it('maxRooms is enforced with server_full (v3; was bad_room)', async () => {
     const hub = makeHub({ maxRooms: 1 });
     const a = new FakeConn('a');
     const b = new FakeConn('b');
     await host(hub, a);
     await host(hub, b, ROOM2);
-    expect(b.take()).toEqual([{ t: 'error', code: 'bad_room' }]);
+    expect(b.take()).toEqual([{ t: 'error', code: 'server_full' }]);
     expect(hub.rooms.size).toBe(1);
+    // Joining or re-hosting an EXISTING room still works at the cap
+    const p = new FakeConn('p');
+    await join(hub, p, DEV_A);
+    expect(p.take()[0]).toMatchObject({ t: 'welcome' });
+    // ...and once a room frees up, the refused host gets in on retry
+    hub.disconnect(a);
+    hub.disconnect(p);
+    await host(hub, b, ROOM2);
+    expect(b.take()[0]).toMatchObject({ t: 'welcome', role: 'pc' });
   });
 });
 
@@ -404,15 +419,15 @@ describe('two phones per room', () => {
     expect(b.id).not.toBe(a.id);
     const forPhones = [pcInfo(), phoneForPhones(a, 1), phoneForPhones(b, 2)];
     expect(b.take()).toEqual([
-      { t: 'welcome', role: 'phone', you: b.id, iceServers: ICE, floor: 'idle', members: forPhones },
-      { t: 'roster', members: forPhones },
+      { t: 'welcome', role: 'phone', you: b.id, iceServers: ICE, floor: 'idle', members: forPhones, phonesHear: true },
+      { t: 'roster', members: forPhones, phonesHear: true },
     ]);
     expect(pc.take()).toEqual([
       { t: 'peer_joined', id: b.id },
-      { t: 'roster', members: [pcInfo(), phoneForPc(a, 1, DEV_A), phoneForPc(b, 2, DEV_B)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(a, 1, DEV_A), phoneForPc(b, 2, DEV_B)], phonesHear: true },
     ]);
     // A hears about B only through the roster (phones never set up WebRTC with each other)
-    expect(a.take()).toEqual([{ t: 'roster', members: forPhones }]);
+    expect(a.take()).toEqual([{ t: 'roster', members: forPhones, phonesHear: true }]);
     expect(room(hub)?.phones.size).toBe(2);
   });
 
@@ -454,7 +469,7 @@ describe('two phones per room', () => {
     expect(c.take()[0]).toMatchObject({ t: 'welcome', role: 'phone', you: c.id });
     expect(pc.take()).toEqual([
       { t: 'peer_joined', id: c.id },
-      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B), phoneForPc(c, 1, DEV_C)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B), phoneForPc(c, 1, DEV_C)], phonesHear: true },
     ]);
   });
 
@@ -589,7 +604,7 @@ describe('replacement', () => {
     const { hub, pc, phone } = await setup();
     const phone2 = new FakeConn('phone2');
     await join(hub, phone2, DEV_B);
-    expect(phone.take()).toEqual([{ t: 'roster', members: [pcInfo(), phoneForPhones(phone, 1), phoneForPhones(phone2, 2)] }]);
+    expect(phone.take()).toEqual([{ t: 'roster', members: [pcInfo(), phoneForPhones(phone, 1), phoneForPhones(phone2, 2)], phonesHear: true }]);
     expect(phone.closed).toBe(0);
     expect(pc.take().map((m) => m.t)).toEqual(['peer_joined', 'roster']);
   });
@@ -610,12 +625,13 @@ describe('replacement', () => {
       iceServers: ICE,
       floor: 'idle',
       members: [pcInfo(), phoneForPhones(again, 1)],
+      phonesHear: true,
     });
     expect(pc.take()).toEqual([
       { t: 'peer_left', id: oldId },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
       { t: 'peer_joined', id: newId },
-      { t: 'roster', members: [pcInfo(), phoneForPc(again, 1, DEV_A)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(again, 1, DEV_A)], phonesHear: true },
     ]);
     // The old connection is no longer a member
     await hub.handle(phone, { t: 'floor_request' });
@@ -633,8 +649,8 @@ describe('replacement', () => {
     expect(a2.take()[0]).toMatchObject({ t: 'welcome', you: a2.id });
     expect(a.take()).toEqual([{ t: 'kicked', reason: 'replaced' }]);
     expect(b.take()).toEqual([
-      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2)] },
-      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2), phoneForPhones(a2, 1)] },
+      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2)], phonesHear: true },
+      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2), phoneForPhones(a2, 1)], phonesHear: true },
     ]);
     expect(pc.take().map((m) => m.t)).toEqual(['peer_left', 'roster', 'peer_joined', 'roster']);
     expect(room(hub)?.phones.size).toBe(2);
@@ -680,9 +696,9 @@ describe('replacement', () => {
     expect(pc.take()).toEqual([
       { t: 'floor', holder: 'idle' },
       { t: 'peer_left', id: oldId },
-      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B)], phonesHear: true },
       { t: 'peer_joined', id: a2.id },
-      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B), phoneForPc(a2, 1, DEV_A)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(b, 2, DEV_B), phoneForPc(a2, 1, DEV_A)], phonesHear: true },
     ]);
     expect(b.take()[0]).toEqual({ t: 'floor', holder: 'idle' });
     expect(a2.take()[0]).toMatchObject({ t: 'welcome', floor: 'idle' });
@@ -724,7 +740,7 @@ describe('kick', () => {
       { t: 'peer_left', id: a.id },
       { t: 'peer_left', id: b.id },
     ]);
-    expect(pc.all.filter((m) => m.t === 'roster').at(-1)).toEqual({ t: 'roster', members: [pcInfo()] });
+    expect(pc.all.filter((m) => m.t === 'roster').at(-1)).toEqual({ t: 'roster', members: [pcInfo()], phonesHear: true });
     expect(room(hub)?.phones.size).toBe(0);
     expect(hub.rooms.has(ROOM)).toBe(true);
   });
@@ -734,11 +750,11 @@ describe('kick', () => {
     await hub.handle(pc, { t: 'kick', id: b.id });
     expect(b.take()).toEqual([{ t: 'kicked', reason: 'kicked' }]);
     expect(b.closed).toBe(1);
-    expect(a.take()).toEqual([{ t: 'roster', members: [pcInfo(), phoneForPhones(a, 1)] }]);
+    expect(a.take()).toEqual([{ t: 'roster', members: [pcInfo(), phoneForPhones(a, 1)], phonesHear: true }]);
     expect(a.closed).toBe(0);
     expect(pc.take()).toEqual([
       { t: 'peer_left', id: b.id },
-      { t: 'roster', members: [pcInfo(), phoneForPc(a, 1, DEV_A)] },
+      { t: 'roster', members: [pcInfo(), phoneForPc(a, 1, DEV_A)], phonesHear: true },
     ]);
     // A is still a working member
     await hub.handle(a, { t: 'floor_request' });
@@ -785,7 +801,7 @@ describe('kick', () => {
     expect(pc.take().map((m) => m.t)).toEqual(['floor', 'peer_left', 'roster']);
     expect(b.take()).toEqual([
       { t: 'floor', holder: 'idle' },
-      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2)] },
+      { t: 'roster', members: [pcInfo(), phoneForPhones(b, 2)], phonesHear: true },
     ]);
   });
 });
@@ -799,8 +815,8 @@ describe('re-hosting a new code', () => {
       expect(p.closed).toBe(1);
     }
     expect(pc.take()).toEqual([
-      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo()] },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'welcome', role: 'pc', you: 'pc', iceServers: ICE, floor: 'idle', members: [pcInfo()], phonesHear: true },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
     ]);
     expect(hub.rooms.has(ROOM)).toBe(false);
     expect(hub.rooms.has(ROOM2)).toBe(true);
@@ -890,7 +906,7 @@ describe('floor', () => {
     expect(pc.take()).toEqual([]);
   });
 
-  it('request while the other side is absent -> busy (PC needs a phone, a phone needs the PC)', async () => {
+  it('request while alone in the room -> busy (PC alone, or a phone alone)', async () => {
     const hub = makeHub();
     const pc = new FakeConn('pc');
     await host(hub, pc);
@@ -898,16 +914,36 @@ describe('floor', () => {
     await hub.handle(pc, { t: 'floor_request' });
     expect(pc.take()).toEqual([{ t: 'busy' }]);
     const a = new FakeConn('a');
+    await join(hub, a, DEV_A);
+    hub.disconnect(pc);
+    a.take();
+    await hub.handle(a, { t: 'floor_request' });
+    expect(a.take()).toEqual([{ t: 'busy' }]);
+    expect(room(hub)?.floor).toBe('idle');
+  });
+
+  it('v3: two phones and no PC share the floor between themselves', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
     const b = new FakeConn('b');
     await join(hub, a, DEV_A);
     await join(hub, b, DEV_B);
-    hub.disconnect(pc);
     a.take();
     b.take();
-    // Two phones but no PC: still busy (phones only ever talk through the PC)
     await hub.handle(a, { t: 'floor_request' });
-    expect(a.take()).toEqual([{ t: 'busy' }]);
-    expect(b.take()).toEqual([]);
+    expect(a.take()).toEqual([{ t: 'floor', holder: a.id }]);
+    expect(b.take()).toEqual([{ t: 'floor', holder: a.id }]);
+    await hub.handle(b, { t: 'floor_request' });
+    expect(b.take()).toEqual([{ t: 'busy' }]);
+    await hub.handle(a, { t: 'floor_release' });
+    expect(a.take()).toEqual([{ t: 'floor', holder: 'idle' }]);
+    expect(b.take()).toEqual([{ t: 'floor', holder: 'idle' }]);
+    await hub.handle(b, { t: 'floor_request' });
+    expect(a.take()).toEqual([{ t: 'floor', holder: b.id }]);
+    // The PC arriving mid-transmission sees B holding the floor
+    const pc = new FakeConn('pc');
+    await host(hub, pc);
+    expect(pc.take()[0]).toMatchObject({ t: 'welcome', floor: b.id });
   });
 
   it('floor auto-released when the holder disconnects', async () => {
@@ -919,7 +955,7 @@ describe('floor', () => {
     expect(pc.take()).toEqual([
       { t: 'floor', holder: 'idle' },
       { t: 'peer_left', id },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
     ]);
     const phone2 = new FakeConn('phone2');
     await join(hub, phone2, DEV_B);
@@ -989,7 +1025,7 @@ describe('floor', () => {
       expect(room(hub)?.floor).toBe(b.id);
     });
 
-    it('PC leaving while phone A holds the floor releases it (nobody could relay A any more)', async () => {
+    it('v3: PC leaving while phone A holds the floor: A keeps it (B hears A directly)', async () => {
       vi.useFakeTimers();
       try {
         const { hub, pc, a, b } = await setup2(makeHub({ maxTxMs: 1000 }));
@@ -999,41 +1035,58 @@ describe('floor', () => {
         hub.disconnect(pc);
         for (const p of [a, b]) {
           expect(p.take()).toEqual([
-            { t: 'floor', holder: 'idle' },
             { t: 'peer_left', id: 'pc' },
-            { t: 'roster', members: [phoneForPhones(a, 1), phoneForPhones(b, 2)] },
+            { t: 'roster', members: [phoneForPhones(a, 1), phoneForPhones(b, 2)], phonesHear: true },
           ]);
         }
-        expect(room(hub)?.floor).toBe('idle');
+        expect(room(hub)?.floor).toBe(a.id);
+        // B is still busy while A talks
+        await hub.handle(b, { t: 'floor_request' });
+        expect(b.take()).toEqual([{ t: 'busy' }]);
+        // The max-TX timer still runs for A
+        vi.advanceTimersByTime(1000);
+        expect(a.take()).toEqual([{ t: 'floor', holder: 'idle' }]);
+        expect(b.take()).toEqual([{ t: 'floor', holder: 'idle' }]);
         expect(vi.getTimerCount()).toBe(0);
-        // A's late release is a no-op
-        await hub.handle(a, { t: 'floor_release' });
-        expect(a.take()).toEqual([]);
-        expect(b.take()).toEqual([]);
       } finally {
         vi.useRealTimers();
       }
     });
 
-    it('PC leaving with a single phone holding the floor releases it too', async () => {
+    it('v3: PC leaving with a single phone holding the floor: the phone keeps it (its release then goes idle)', async () => {
       const { hub, pc, phone } = await setup();
       await hub.handle(phone, { t: 'floor_request' });
       phone.take();
       hub.disconnect(pc);
-      expect(phone.take()[0]).toEqual({ t: 'floor', holder: 'idle' });
-      // and the returning PC's welcome shows idle
+      expect(phone.take().map((m) => m.t)).toEqual(['peer_left', 'roster']);
+      expect(room(hub)?.floor).toBe(phone.id);
+      // The returning PC's welcome shows the phone still talking
       const pc2 = new FakeConn('pc2');
       await host(hub, pc2);
-      expect(pc2.take()[0]).toMatchObject({ t: 'welcome', floor: 'idle' });
+      expect(pc2.take()[0]).toMatchObject({ t: 'welcome', floor: phone.id });
+      await hub.handle(phone, { t: 'floor_release' });
+      expect(pc2.take()).toEqual([{ t: 'floor', holder: 'idle' }]);
     });
 
-    it('PC replaced by a new PC connection while a phone holds the floor: released before peer_left', async () => {
+    it('v3: PC replaced by a new PC connection while a phone holds the floor: the floor stays with the phone', async () => {
       const { hub, pc, a, b } = await setup2();
       await hub.handle(a, { t: 'floor_request' });
       for (const c of [pc, a, b]) c.take();
-      await host(hub, new FakeConn('pc2'));
+      const pc2 = new FakeConn('pc2');
+      await host(hub, pc2);
       expect(pc.take()).toEqual([{ t: 'kicked', reason: 'replaced' }]);
-      expect(b.take().map((m) => m.t)).toEqual(['floor', 'peer_left', 'roster', 'peer_joined', 'roster']);
+      expect(b.take().map((m) => m.t)).toEqual(['peer_left', 'roster', 'peer_joined', 'roster']);
+      expect(pc2.take()[0]).toMatchObject({ t: 'welcome', floor: a.id });
+    });
+
+    it('the PC holding the floor and leaving releases it', async () => {
+      const { hub, pc, a, b } = await setup2();
+      await hub.handle(pc, { t: 'floor_request' });
+      a.take();
+      b.take();
+      hub.disconnect(pc);
+      expect(a.take()[0]).toEqual({ t: 'floor', holder: 'idle' });
+      expect(room(hub)?.floor).toBe('idle');
     });
 
     it('the max TX timeout applies to a phone holder too and reaches all three', async () => {
@@ -1113,10 +1166,10 @@ describe('signal relay', () => {
     await hub.handle(pc, { t: 'signal', to: phone.id, cid: CID, data: offer });
     expect(phone.take()).toEqual([{ t: 'signal', from: 'pc', cid: CID, data: offer }]);
     expect(pc.take()).toEqual([]);
-    await hub.handle(phone, { t: 'signal', cid: CID, data: answer });
+    await hub.handle(phone, { t: 'signal', to: 'pc', cid: CID, data: answer });
     expect(pc.take()).toEqual([{ t: 'signal', from: phone.id, cid: CID, data: answer }]);
-    await hub.handle(phone, { t: 'signal', cid: CID, data: { kind: 'ice', candidate: cand } });
-    await hub.handle(phone, { t: 'signal', cid: CID, data: { kind: 'ice', candidate: null } });
+    await hub.handle(phone, { t: 'signal', to: 'pc', cid: CID, data: { kind: 'ice', candidate: cand } });
+    await hub.handle(phone, { t: 'signal', to: 'pc', cid: CID, data: { kind: 'ice', candidate: null } });
     expect(pc.take()).toEqual([
       { t: 'signal', from: phone.id, cid: CID, data: { kind: 'ice', candidate: cand } },
       { t: 'signal', from: phone.id, cid: CID, data: { kind: 'ice', candidate: null } },
@@ -1132,10 +1185,10 @@ describe('signal relay', () => {
     expect(pc.take()).toEqual([]);
   });
 
-  it('each phone reaches the PC tagged with its own id, and never the other phone', async () => {
+  it("each phone reaches the PC (to: 'pc') tagged with its own id, and the other phone gets nothing", async () => {
     const { hub, pc, a, b } = await setup2();
-    await hub.handle(a, { t: 'signal', cid: 'cid-from-a', data: answer });
-    await hub.handle(b, { t: 'signal', cid: 'cid-from-b', data: answer });
+    await hub.handle(a, { t: 'signal', to: 'pc', cid: 'cid-from-a', data: answer });
+    await hub.handle(b, { t: 'signal', to: 'pc', cid: 'cid-from-b', data: answer });
     expect(pc.take()).toEqual([
       { t: 'signal', from: a.id, cid: 'cid-from-a', data: answer },
       { t: 'signal', from: b.id, cid: 'cid-from-b', data: answer },
@@ -1144,17 +1197,69 @@ describe('signal relay', () => {
     expect(b.take()).toEqual([]);
   });
 
-  it('a phone cannot address the other phone: `to` from a phone is ignored and it goes to the PC', async () => {
+  it('v3: a phone signal without `to` is dropped (it no longer defaults to the PC)', async () => {
+    const { hub, pc, a, b } = await setup2();
+    await hub.handle(a, { t: 'signal', cid: CID, data: answer });
+    for (const c of [pc, a, b]) expect(c.take()).toEqual([]);
+  });
+
+  it('v3: phone -> phone signals are routed by `to`, with the PC in the room', async () => {
     const { hub, pc, a, b } = await setup2();
     await hub.handle(a, { t: 'signal', to: b.id, cid: CID, data: offer });
-    expect(b.take()).toEqual([]);
-    expect(pc.take()).toEqual([{ t: 'signal', from: a.id, cid: CID, data: offer }]);
+    expect(b.take()).toEqual([{ t: 'signal', from: a.id, cid: CID, data: offer }]);
+    expect(pc.take()).toEqual([]);
+    await hub.handle(b, { t: 'signal', to: a.id, cid: CID, data: answer });
+    expect(a.take()).toEqual([{ t: 'signal', from: b.id, cid: CID, data: answer }]);
+    expect(pc.take()).toEqual([]);
+  });
+
+  it('v3: phone -> phone signals with no PC in the room (offer, answer, ice)', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
+    const b = new FakeConn('b');
+    await join(hub, a, DEV_A);
+    await join(hub, b, DEV_B);
+    a.take();
+    b.take();
+    await hub.handle(a, { t: 'signal', to: b.id, cid: CID, data: offer });
+    await hub.handle(b, { t: 'signal', to: a.id, cid: CID, data: answer });
+    await hub.handle(b, { t: 'signal', to: a.id, cid: CID, data: { kind: 'ice', candidate: cand } });
+    expect(b.take()).toEqual([{ t: 'signal', from: a.id, cid: CID, data: offer }]);
+    expect(a.take()).toEqual([
+      { t: 'signal', from: b.id, cid: CID, data: answer },
+      { t: 'signal', from: b.id, cid: CID, data: { kind: 'ice', candidate: cand } },
+    ]);
+  });
+
+  it('v3: signals to self, to an unknown member, to the absent PC or to a device id are dropped', async () => {
+    const { hub, pc, a, b } = await setup2();
+    for (const to of [a.id, 'mUnknownUnknown', DEV_B]) await hub.handle(a, { t: 'signal', to, cid: CID, data: offer });
+    for (const c of [pc, a, b]) expect(c.take()).toEqual([]);
+    hub.disconnect(pc);
+    a.take();
+    b.take();
+    await hub.handle(a, { t: 'signal', to: 'pc', cid: CID, data: offer });
+    for (const c of [a, b]) expect(c.take()).toEqual([]);
+  });
+
+  it('v3: the restart kind is passed through (both directions), extra fields stripped', async () => {
+    const { hub, pc, a, b } = await setup2();
+    await hub.handle(a, { t: 'signal', to: 'pc', cid: CID, data: { kind: 'restart', junk: 1 } });
+    expect(pc.take()).toEqual([{ t: 'signal', from: a.id, cid: CID, data: { kind: 'restart' } }]);
+    await hub.handle(b, { t: 'signal', to: a.id, cid: CID, data: { kind: 'restart' } });
+    expect(a.take()).toEqual([{ t: 'signal', from: b.id, cid: CID, data: { kind: 'restart' } }]);
+    // Still needs a valid cid
+    await hub.handle(a, { t: 'signal', to: 'pc', cid: 'x', data: { kind: 'restart' } });
+    expect(a.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+    // An unknown kind is still a bad message
+    await hub.handle(a, { t: 'signal', to: 'pc', cid: CID, data: { kind: 'reboot' } });
+    expect(a.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
   });
 
   it('a spoofed `from` is overwritten by the server', async () => {
     const { hub, pc, a, b } = await setup2();
-    await hub.handle(a, { t: 'signal', from: b.id, cid: CID, data: answer });
-    await hub.handle(a, { t: 'signal', from: 'pc', cid: CID, data: answer });
+    await hub.handle(a, { t: 'signal', to: 'pc', from: b.id, cid: CID, data: answer });
+    await hub.handle(a, { t: 'signal', to: 'pc', from: 'pc', cid: CID, data: answer });
     expect(pc.take()).toEqual([
       { t: 'signal', from: a.id, cid: CID, data: answer },
       { t: 'signal', from: a.id, cid: CID, data: answer },
@@ -1190,7 +1295,7 @@ describe('signal relay', () => {
     const { hub: hub2, pc: pc2, phone } = await setup();
     hub2.disconnect(pc2);
     phone.take();
-    await hub2.handle(phone, { t: 'signal', cid: CID, data: answer });
+    await hub2.handle(phone, { t: 'signal', to: 'pc', cid: CID, data: answer });
     expect(phone.take()).toEqual([]);
   });
 
@@ -1215,9 +1320,9 @@ describe('names', () => {
     const { hub, pc, a, b } = await setup2();
     await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [a.id]: 'Emma', [b.id]: 'Lou' } });
     expect(rosterOf(pc)).toEqual([
-      { t: 'roster', members: [pcInfo('Pit wall'), phoneForPc(a, 1, DEV_A, 'Emma'), phoneForPc(b, 2, DEV_B, 'Lou')] },
+      { t: 'roster', members: [pcInfo('Pit wall'), phoneForPc(a, 1, DEV_A, 'Emma'), phoneForPc(b, 2, DEV_B, 'Lou')], phonesHear: true },
     ]);
-    const forPhones = { t: 'roster', members: [pcInfo('Pit wall'), phoneForPhones(a, 1, 'Emma'), phoneForPhones(b, 2, 'Lou')] };
+    const forPhones = { t: 'roster', members: [pcInfo('Pit wall'), phoneForPhones(a, 1, 'Emma'), phoneForPhones(b, 2, 'Lou')], phonesHear: true };
     expect(a.take()).toEqual([forPhones]);
     expect(b.take()).toEqual([forPhones]);
     // A late joiner's welcome has them too
@@ -1253,8 +1358,8 @@ describe('names', () => {
     ['only spaces', '    '],
     ['only control characters', '\u0001\u0002'],
     ['a number', 42],
-    ['null', null],
     ['an object', { name: 'x' }],
+    ['undefined-ish (false)', false],
   ])('a bad name (%s) rejects the whole message, and no roster is sent', async (_label, bad) => {
     const { hub, pc, phone } = await setup();
     await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [phone.id]: bad } });
@@ -1309,11 +1414,162 @@ describe('names', () => {
     expect(room(hub, ROOM2)?.names).toEqual({});
   });
 
-  it('a later names message replaces the earlier one wholesale', async () => {
+  it('v3: a later names message merges over the earlier one (names it renames change, others stay)', async () => {
     const { hub, pc, a, b } = await setup2();
     await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [a.id]: 'Emma', [b.id]: 'Lou' } });
-    await hub.handle(pc, { t: 'names', names: { [b.id]: 'Lou' } });
-    expect(room(hub)?.names).toEqual({ [b.id]: 'Lou' });
+    await hub.handle(pc, { t: 'names', names: { [b.id]: 'Lulu' } });
+    expect(room(hub)?.names).toEqual({ pc: 'Pit wall', [a.id]: 'Emma', [b.id]: 'Lulu' });
+  });
+
+  it('null clears a name: the roster shows null for it, everyone is told, other names stay', async () => {
+    const { hub, pc, a, b } = await setup2();
+    await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [a.id]: 'Emma', [b.id]: 'Lou' } });
+    for (const c of [pc, a, b]) c.take();
+    await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [a.id]: null, [b.id]: 'Lou' } });
+    expect(room(hub)?.names).toEqual({ pc: 'Pit wall', [b.id]: 'Lou' });
+    for (const p of [a, b]) {
+      expect(rosterOf(p)).toEqual([
+        { t: 'roster', members: [pcInfo('Pit wall'), phoneForPhones(a, 1), phoneForPhones(b, 2, 'Lou')], phonesHear: true },
+      ]);
+    }
+    // Omitting an id leaves it alone (merge); null for an unnamed or non-member id is harmless
+    await hub.handle(pc, { t: 'names', names: { [a.id]: null, mGhostGhostGh: null } });
+    expect(room(hub)?.names).toEqual({ pc: 'Pit wall', [b.id]: 'Lou' });
+    // The PC can clear its own name too
+    await hub.handle(pc, { t: 'names', names: { pc: null } });
+    expect(rosterOf(a).at(-1)?.members[0]).toEqual(pcInfo());
+  });
+
+  it('null also clears the name a phone brought in its join (the PC un-names it)', async () => {
+    const { hub, pc } = await setup();
+    const b = new FakeConn('b');
+    await join(hub, b, DEV_B, ROOM, { name: 'Lou' });
+    expect(room(hub)?.names[b.id]).toBe('Lou');
+    await hub.handle(pc, { t: 'names', names: { [b.id]: null } });
+    expect(room(hub)?.names[b.id]).toBeUndefined();
+  });
+
+  it('a null among valid names is fine, but one invalid non-null name rejects the whole message', async () => {
+    const { hub, pc, phone } = await setup();
+    await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall', [phone.id]: 'Emma' } });
+    pc.take();
+    await hub.handle(pc, { t: 'names', names: { pc: null, [phone.id]: '' } });
+    expect(pc.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+    expect(room(hub)?.names).toEqual({ pc: 'Pit wall', [phone.id]: 'Emma' });
+  });
+
+  describe('v3: a phone brings its own name in join', () => {
+    it('the join name is shown to everyone (PC and the other phone) until the PC names it', async () => {
+      const hub = makeHub();
+      const pc = new FakeConn('pc');
+      const a = new FakeConn('a');
+      const b = new FakeConn('b');
+      await host(hub, pc);
+      await join(hub, a, DEV_A, ROOM, { name: '  Emma  ' });
+      await join(hub, b, DEV_B, ROOM, { name: 'Lou' });
+      const wb = b.all.find((m) => m.t === 'welcome') as Extract<ServerMsg, { t: 'welcome' }>;
+      expect(wb.members.find((m) => m.id === a.id)?.name).toBe('Emma');
+      expect(wb.members.find((m) => m.id === b.id)?.name).toBe('Lou');
+      const pcRoster = pc.all.filter((m) => m.t === 'roster').at(-1) as Extract<ServerMsg, { t: 'roster' }>;
+      expect(pcRoster.members.map((m) => m.name)).toEqual([null, 'Emma', 'Lou']);
+      for (const c of [pc, a, b]) c.take();
+      // The PC names A: that wins; B keeps its own
+      await hub.handle(pc, { t: 'names', names: { [a.id]: 'Emma R' } });
+      const r = rosterOf(b)[0];
+      expect(r.members.map((m) => m.name)).toEqual([null, 'Emma R', 'Lou']);
+    });
+
+    it('works without a PC too (phones see each other by their own names)', async () => {
+      const hub = makeHub();
+      const a = new FakeConn('a');
+      const b = new FakeConn('b');
+      await join(hub, a, DEV_A, ROOM, { name: 'Emma' });
+      await join(hub, b, DEV_B, ROOM, { name: 'Lou' });
+      const r = a.all.filter((m) => m.t === 'roster').at(-1) as Extract<ServerMsg, { t: 'roster' }>;
+      expect(r.members.map((m) => [m.id, m.name])).toEqual([
+        [a.id, 'Emma'],
+        [b.id, 'Lou'],
+      ]);
+    });
+
+    it.each([
+      ['too long', 'x'.repeat(25)],
+      ['empty', ''],
+      ['only control characters', '\u0001\u0002'],
+    ])('an unusable join name (%s) is ignored (name null), the join still succeeds', async (_l, name) => {
+      const hub = makeHub();
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A, ROOM, { name });
+      const w = a.take()[0] as Extract<ServerMsg, { t: 'welcome' }>;
+      expect(w.t).toBe('welcome');
+      expect(w.members[0].name).toBeNull();
+    });
+
+    it('a non-string join name or push is a bad message', async () => {
+      const hub = makeHub();
+      for (const extra of [{ name: 5 }, { push: 5 }, { name: { x: 1 } }]) {
+        const a = new FakeConn('a');
+        await join(hub, a, DEV_A, ROOM, extra);
+        expect(a.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+      }
+    });
+
+    it('a phone cannot use its join name to set the PC name or another phone name', async () => {
+      const { hub, pc } = await setup();
+      await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall' } });
+      const b = new FakeConn('b');
+      await join(hub, b, DEV_B, ROOM, { name: 'Pit wall?' });
+      expect(room(hub)?.names.pc).toBe('Pit wall');
+    });
+  });
+
+  describe('v3: pushId in the roster', () => {
+    const PUSH_A = 'pushAAAAAAAAAAAAAAAAAA';
+    const PUSH_B = 'pushBBBBBBBBBBBBBBBBBB';
+
+    it('both the PC copy and the phone copy carry pushId; device only in the PC copy', async () => {
+      const hub = makeHub();
+      const pc = new FakeConn('pc');
+      const a = new FakeConn('a');
+      const b = new FakeConn('b');
+      await host(hub, pc);
+      await join(hub, a, DEV_A, ROOM, { push: PUSH_A });
+      await join(hub, b, DEV_B, ROOM, { push: PUSH_B });
+      const last = (c: FakeConn) => c.all.filter((m) => m.t === 'roster').at(-1) as Extract<ServerMsg, { t: 'roster' }>;
+      expect(last(pc).members).toEqual([
+        pcInfo(),
+        { ...phoneForPc(a, 1, DEV_A), pushId: PUSH_A },
+        { ...phoneForPc(b, 2, DEV_B), pushId: PUSH_B },
+      ]);
+      for (const p of [a, b]) {
+        expect(last(p).members).toEqual([
+          pcInfo(),
+          { ...phoneForPhones(a, 1), pushId: PUSH_A },
+          { ...phoneForPhones(b, 2), pushId: PUSH_B },
+        ]);
+        expect(JSON.stringify(p.all)).not.toMatch(/devA|devB/);
+      }
+      // The welcome too
+      const wb = b.all.find((m) => m.t === 'welcome') as Extract<ServerMsg, { t: 'welcome' }>;
+      expect(wb.members.find((m) => m.id === a.id)?.pushId).toBe(PUSH_A);
+      expect('device' in wb.members.find((m) => m.id === a.id)!).toBe(false);
+    });
+
+    it('an invalid push id is left out (the join still succeeds)', async () => {
+      const hub = makeHub();
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A, ROOM, { push: 'short' });
+      const w = a.take()[0] as Extract<ServerMsg, { t: 'welcome' }>;
+      expect('pushId' in w.members[0]).toBe(false);
+    });
+
+    it('the PC entry never has a pushId (host has no push field)', async () => {
+      const hub = makeHub();
+      const pc = new FakeConn('pc');
+      await host(hub, pc, ROOM, { push: PUSH_A });
+      const w = pc.take()[0] as Extract<ServerMsg, { t: 'welcome' }>;
+      expect(w.members).toEqual([pcInfo()]);
+    });
   });
 
   it("a member's name is dropped when it leaves (and isn't inherited by the next phone)", async () => {
@@ -1396,7 +1652,7 @@ describe('disconnect during async getIceServers', () => {
     hub.disconnect(phone);
     expect(pc.take()).toEqual([
       { t: 'peer_left', id },
-      { t: 'roster', members: [pcInfo()] },
+      { t: 'roster', members: [pcInfo()], phonesHear: true },
     ]);
     release();
     await p;
@@ -1468,7 +1724,7 @@ describe('refreshIce', () => {
     expect(getIceServers).not.toHaveBeenCalled();
     const { pc, a, b } = await setup2(hub);
     const stranger = new FakeConn('stranger');
-    await join(hub, stranger, DEV_C, ROOM2); // no_host
+    await join(hub, stranger, DEV_C, 'short'); // bad_room (a missing room is now created, so use a bad code)
     const refused = new FakeConn('refused');
     await join(hub, refused, DEV_C); // room_full
     stranger.take();
@@ -1616,6 +1872,29 @@ describe('pairing codes', () => {
     const phone = new FakeConn('phone');
     await hub.handle(phone, { t: 'pair_claim', code });
     expect(phone.take()).toEqual([{ t: 'error', code: 'bad_code' }]);
+  });
+
+  // Regression: pairing stays PC-only even though phones can keep a room alive
+  it('a code stops working once the PC has gone, even while a phone keeps the room', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { pc, code } = await pcWithCode(hub);
+    await join(hub, new FakeConn('a'), DEV_A, ROOM, { key: KEY });
+    hub.disconnect(pc);
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'pair_claim', code });
+    expect(phone.take()).toEqual([{ t: 'error', code: 'bad_code' }]);
+  });
+
+  it('a full room with no PC answers room_full and does not use up the code', async () => {
+    const hub = makeHub({ accessKey: KEY });
+    const { pc, code } = await pcWithCode(hub);
+    await join(hub, new FakeConn('a'), DEV_A, ROOM, { key: KEY });
+    await join(hub, new FakeConn('b'), DEV_B, ROOM, { key: KEY });
+    hub.disconnect(pc);
+    const third = new FakeConn('third');
+    await hub.handle(third, { t: 'pair_claim', code });
+    expect(third.take()).toEqual([{ t: 'error', code: 'room_full' }]);
+    expect(third.closed).toBe(0);
   });
 
   it('limits guesses per connection and server-wide', async () => {
@@ -2121,15 +2400,428 @@ describe('isPushSub / isPhoneToPcMsg', () => {
     }
   });
 
-  it('isPhoneToPcMsg: push_sub needs a valid sub, push_unsub a bounded string', () => {
-    expect(isPhoneToPcMsg({ t: 'push_sub', sub: SUB_A })).toBe(true);
-    expect(isPhoneToPcMsg({ t: 'push_sub', sub: { ...SUB_A, endpoint: 'https://evil.example/x' } })).toBe(false);
-    expect(isPhoneToPcMsg({ t: 'push_sub' })).toBe(false);
-    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: SUB_A.endpoint })).toBe(true);
-    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: 'x'.repeat(1025) })).toBe(false);
-    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: 5 })).toBe(false);
-    expect(isPhoneToPcMsg({ t: 'fx_file', name: 'a', b64: '' })).toBe(false);
-    expect(isPhoneToPcMsg(null)).toBe(false);
-    expect(isPhoneToPcMsg('push_sub')).toBe(false);
+  // v3: push_sub/push_unsub (isPhoneToPcMsg) are gone; the directory syncs as {t:'dir', entries}
+  it('isPushEntry / isDirMsg: owner must be an id, sub valid or null, ts a positive number', () => {
+    const OWNER = 'ownerAAAAAAAAAAAAAAAAA';
+    expect(isPushEntry({ owner: OWNER, sub: SUB_A, ts: 1 })).toBe(true);
+    expect(isPushEntry({ owner: OWNER, sub: null, ts: 1 })).toBe(true);
+    for (const bad of [
+      { owner: 'short', sub: SUB_A, ts: 1 },
+      { owner: 'pc', sub: SUB_A, ts: 1 },
+      { owner: OWNER, sub: { ...SUB_A, endpoint: 'https://evil.example/x' }, ts: 1 },
+      { owner: OWNER, sub: SUB_A, ts: 0 },
+      { owner: OWNER, sub: SUB_A, ts: -5 },
+      { owner: OWNER, sub: SUB_A, ts: Infinity },
+      { owner: OWNER, sub: SUB_A, ts: '1' },
+      { owner: OWNER, sub: undefined, ts: 1 },
+      null,
+      'dir',
+    ]) {
+      expect(isPushEntry(bad), JSON.stringify(bad)).toBe(false);
+    }
+    expect(isDirMsg({ t: 'dir', entries: [] })).toBe(true);
+    expect(isDirMsg({ t: 'dir', entries: [{ owner: OWNER, sub: null, ts: 1 }] })).toBe(true);
+    expect(isDirMsg({ t: 'dir', entries: Array.from({ length: 13 }, () => ({ owner: OWNER, sub: null, ts: 1 })) })).toBe(false);
+    expect(isDirMsg({ t: 'dir', entries: [{ owner: 'x', sub: null, ts: 1 }] })).toBe(false);
+    expect(isDirMsg({ t: 'dir' })).toBe(false);
+    expect(isDirMsg({ t: 'push_sub', sub: SUB_A })).toBe(false);
+  });
+});
+
+// ---------- v3: rooms started by a phone ----------
+
+describe('v3: a phone creates the room', () => {
+  it('the second phone joins with no PC, sees the first, and both get the same roster', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
+    const b = new FakeConn('b');
+    await join(hub, a, DEV_A);
+    a.take();
+    await join(hub, b, DEV_B);
+    const forPhones = [phoneForPhones(a, 1), phoneForPhones(b, 2)];
+    expect(b.take()).toEqual([
+      { t: 'welcome', role: 'phone', you: b.id, iceServers: ICE, floor: 'idle', members: forPhones, phonesHear: true },
+      { t: 'roster', members: forPhones, phonesHear: true },
+    ]);
+    // A only gets the roster: phones learn about each other from it (no peer_joined between phones)
+    expect(a.take()).toEqual([{ t: 'roster', members: forPhones, phonesHear: true }]);
+    expect(room(hub)?.pc).toBeNull();
+  });
+
+  it('the PC arriving later joins the phone-made room and sees both phones with devices', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
+    const b = new FakeConn('b');
+    await join(hub, a, DEV_A);
+    await join(hub, b, DEV_B);
+    a.take();
+    b.take();
+    const pc = new FakeConn('pc');
+    await host(hub, pc);
+    expect(pc.take()[0]).toEqual({
+      t: 'welcome',
+      role: 'pc',
+      you: 'pc',
+      iceServers: ICE,
+      floor: 'idle',
+      members: [pcInfo(), phoneForPc(a, 1, DEV_A), phoneForPc(b, 2, DEV_B)],
+      phonesHear: true,
+    });
+    for (const p of [a, b]) expect(p.take().map((m) => m.t)).toEqual(['peer_joined', 'roster']);
+  });
+
+  it('the room is deleted when the last phone leaves, and a later phone creates it again', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
+    await join(hub, a, DEV_A);
+    hub.disconnect(a);
+    expect(hub.rooms.size).toBe(0);
+    const b = new FakeConn('b');
+    await join(hub, b, DEV_B);
+    expect(b.take()[0]).toMatchObject({ t: 'welcome', members: [{ slot: 1 }] });
+  });
+
+  it('a phone-made room still needs the access key when the server has one', async () => {
+    const hub = makeHub({ accessKey: 'secret-key-0123456789' });
+    const a = new FakeConn('a');
+    await join(hub, a, DEV_A);
+    expect(a.take()).toEqual([{ t: 'error', code: 'unauthorized' }]);
+    expect(hub.rooms.size).toBe(0);
+    const b = new FakeConn('b');
+    await join(hub, b, DEV_B, ROOM, { key: 'secret-key-0123456789' });
+    expect(b.take()[0]).toMatchObject({ t: 'welcome' });
+  });
+
+  it('a third phone in a phone-only room gets room_full', async () => {
+    const hub = makeHub();
+    await join(hub, new FakeConn('a'), DEV_A);
+    await join(hub, new FakeConn('b'), DEV_B);
+    const c = new FakeConn('c');
+    await join(hub, c, DEV_C);
+    expect(c.take()).toEqual([{ t: 'error', code: 'room_full' }]);
+  });
+
+  it('PC-only commands from a phone in a phone-only room are ignored', async () => {
+    const hub = makeHub();
+    const a = new FakeConn('a');
+    const b = new FakeConn('b');
+    await join(hub, a, DEV_A);
+    await join(hub, b, DEV_B);
+    a.take();
+    b.take();
+    for (const m of [
+      { t: 'pair_create' },
+      { t: 'kick', id: b.id },
+      { t: 'names', names: { [b.id]: 'X' } },
+      { t: 'room_settings', phonesHear: false },
+      { t: 'announce', subs: [] },
+    ]) {
+      await hub.handle(a, m);
+    }
+    for (const c of [a, b]) expect(c.take()).toEqual([]);
+    expect(b.closed).toBe(0);
+  });
+});
+
+// ---------- v3: room settings ----------
+
+describe('v3: room_settings {phonesHear}', () => {
+  it('the PC sets it; everyone gets a roster with it, and later welcomes carry it', async () => {
+    const { hub, pc, a, b } = await setup2();
+    await hub.handle(pc, { t: 'room_settings', phonesHear: false });
+    expect(pc.take()).toEqual([
+      { t: 'roster', members: [pcInfo(), phoneForPc(a, 1, DEV_A), phoneForPc(b, 2, DEV_B)], phonesHear: false },
+    ]);
+    for (const p of [a, b]) {
+      expect(p.take()).toEqual([{ t: 'roster', members: [pcInfo(), phoneForPhones(a, 1), phoneForPhones(b, 2)], phonesHear: false }]);
+    }
+    // A reconnecting phone's welcome has it
+    const b2 = new FakeConn('b2');
+    await join(hub, b2, DEV_B);
+    expect(b2.take()[0]).toMatchObject({ t: 'welcome', phonesHear: false });
+    // ...and it stays after the PC leaves (the phones only apply it while the PC is there)
+    hub.disconnect(pc);
+    expect(a.all.filter((m) => m.t === 'roster').at(-1)).toMatchObject({ phonesHear: false });
+    // Back on
+    const pc2 = new FakeConn('pc2');
+    await host(hub, pc2);
+    expect(pc2.take()[0]).toMatchObject({ t: 'welcome', phonesHear: false });
+    await hub.handle(pc2, { t: 'room_settings', phonesHear: true });
+    expect(a.all.filter((m) => m.t === 'roster').at(-1)).toMatchObject({ phonesHear: true });
+  });
+
+  it('a new room defaults to phonesHear: true', async () => {
+    const hub = makeHub();
+    const pc = new FakeConn('pc');
+    await host(hub, pc);
+    expect(pc.take()[0]).toMatchObject({ t: 'welcome', phonesHear: true });
+  });
+
+  it('phones cannot change it', async () => {
+    const { hub, pc, a, b } = await setup2();
+    await hub.handle(a, { t: 'room_settings', phonesHear: false });
+    for (const c of [pc, a, b]) expect(c.take()).toEqual([]);
+    expect(room(hub)?.phonesHear).toBe(true);
+  });
+
+  it.each([[{}], [{ phonesHear: 'no' }], [{ phonesHear: 0 }], [{ phonesHear: null }]])(
+    'a non-boolean phonesHear (%j) is a bad message',
+    async (extra) => {
+      const { hub, pc } = await setup();
+      await hub.handle(pc, { t: 'room_settings', ...extra });
+      expect(pc.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+    },
+  );
+
+  it('before host/join -> not_in_room', async () => {
+    const hub = makeHub();
+    const c = new FakeConn('c');
+    await hub.handle(c, { t: 'room_settings', phonesHear: false });
+    expect(c.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+  });
+});
+
+// ---------- v3: ping ----------
+
+describe('v3: ping', () => {
+  const pinged = (c: FakeConn) => c.take().filter((m) => m.t === 'pinged');
+
+  it('a phone pings: the given subs go to the pusher with the ping payload; sent/gone are passed through', async () => {
+    const push = new FakePusher();
+    push.result = { sent: 1, gone: [SUB_B.endpoint] };
+    const hub = makeHub({ push });
+    const a = new FakeConn('a');
+    await join(hub, a, DEV_A, ROOM, { name: 'Emma' });
+    a.take();
+    await hub.handle(a, { t: 'ping', subs: [SUB_A, SUB_B] });
+    expect(push.calls).toHaveLength(1);
+    expect(push.calls[0].subs).toEqual([SUB_A, SUB_B]);
+    expect(push.calls[0].payload).toMatchObject({ title: 'Pit Princess', tag: 'ping' });
+    expect((push.calls[0].payload as { body: string }).body).toContain('Emma');
+    expect(a.take()).toEqual([{ t: 'pinged', sent: 1, gone: [SUB_B.endpoint], limited: false }]);
+  });
+
+  it('the PC can ping too, and the sender is named (PC name, or "Phone N")', async () => {
+    const push = new FakePusher();
+    const { hub, pc, phone } = await setup(makeHub({ push }));
+    await hub.handle(pc, { t: 'names', names: { pc: 'Pit wall' } });
+    await hub.handle(pc, { t: 'ping', subs: [SUB_A] });
+    expect((push.calls[0].payload as { body: string }).body).toContain('Pit wall');
+    expect(pinged(pc)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: false }]);
+    void phone;
+    // Another room: an unnamed phone
+    const p = new FakeConn('p');
+    await join(hub, p, DEV_B, ROOM2);
+    await hub.handle(p, { t: 'ping', subs: [SUB_B] });
+    expect((push.calls[1].payload as { body: string }).body).toContain('Phone 1');
+  });
+
+  it('one ping per room per 30 s: the second is refused with limited, even from another member', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const a = new FakeConn('a');
+      const b = new FakeConn('b');
+      await join(hub, a, DEV_A);
+      await join(hub, b, DEV_B);
+      a.take();
+      b.take();
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(1);
+      vi.advanceTimersByTime(29_999);
+      await hub.handle(b, { t: 'ping', subs: [SUB_A] });
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      expect(pinged(b)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: true }]);
+      expect(pinged(a)).toEqual([
+        { t: 'pinged', sent: 0, gone: [], limited: false },
+        { t: 'pinged', sent: 0, gone: [], limited: true },
+      ]);
+      expect(push.calls).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      await hub.handle(b, { t: 'ping', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(2);
+      expect(pinged(b)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: false }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the room cooldown survives the room being emptied and re-created', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A);
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      hub.disconnect(a);
+      const a2 = new FakeConn('a2');
+      await join(hub, a2, DEV_A);
+      a2.take();
+      await hub.handle(a2, { t: 'ping', subs: [SUB_A] });
+      expect(pinged(a2)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: true }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('at most 3 pings per connection per minute, even across rooms (the 4th is limited)', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const a = new FakeConn('a');
+      const rooms = ['room-ping-0000000001', 'room-ping-0000000002', 'room-ping-0000000003', 'room-ping-0000000004'];
+      for (const [i, code] of rooms.entries()) {
+        // The same connection switches rooms (a re-join with another code), so the room cooldown doesn't apply
+        await join(hub, a, DEV_A, code);
+        a.take();
+        await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+        const res = pinged(a);
+        expect(res, `ping #${i + 1}`).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: i === 3 }]);
+        vi.advanceTimersByTime(1000);
+      }
+      expect(push.calls).toHaveLength(3);
+      // A minute after the first, one frees up
+      vi.advanceTimersByTime(60_000 - 4000 + 1);
+      await join(hub, a, DEV_A, 'room-ping-0000000005');
+      a.take();
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      expect(pinged(a)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: false }]);
+      expect(push.calls).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('pings share the server-wide budget with announce (30 per minute)', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      for (let i = 0; i < 30; i++) {
+        const pc = await pcAlone(hub, `room-budget-${String(i).padStart(6, '0')}`);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      }
+      expect(push.calls).toHaveLength(30);
+      const p = new FakeConn('p');
+      await join(hub, p, DEV_A);
+      p.take();
+      await hub.handle(p, { t: 'ping', subs: [SUB_A] });
+      expect(pinged(p)).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: true }]);
+      expect(push.calls).toHaveLength(30);
+      // ...and a ping uses up announce budget
+      vi.advanceTimersByTime(60_000);
+      await hub.handle(p, { t: 'ping', subs: [SUB_A] }); // sent; room cooldown never started
+      expect(push.calls).toHaveLength(31);
+      for (let i = 0; i < 29; i++) {
+        const pc = await pcAlone(hub, `room-budget2-${String(i).padStart(6, '0')}`);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      }
+      expect(push.calls).toHaveLength(60);
+      const late = await pcAlone(hub, 'room-budget-late-0001');
+      await hub.handle(late, { t: 'announce', subs: [SUB_A] });
+      expect(late.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+      expect(push.calls).toHaveLength(60);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('no pusher configured: pinged {sent:0, limited:false, unavailable:true}, every time, even with no subs', async () => {
+    const unavailable = { t: 'pinged', sent: 0, gone: [], limited: false, unavailable: true };
+    for (const hub of [makeHub(), makeHub({ push: null })]) {
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A);
+      a.take();
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      expect(a.take()).toEqual([unavailable]);
+      // ...repeated pings are not reported as limited
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      expect(a.take()).toEqual([unavailable]);
+      await hub.handle(a, { t: 'ping', subs: [] });
+      expect(a.take()).toEqual([unavailable]);
+    }
+  });
+
+  it('with a pusher, replies never carry unavailable (sent, empty, limited, or failed)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A);
+      a.take();
+      await hub.handle(a, { t: 'ping', subs: [] });
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+      await hub.handle(a, { t: 'ping', subs: [SUB_A] }); // limited
+      push.error = new Error('x');
+      const b = new FakeConn('b');
+      await join(hub, b, DEV_B, ROOM2);
+      b.take();
+      await hub.handle(b, { t: 'ping', subs: [SUB_A] }); // throws
+      for (const m of [...a.all, ...b.all]) if (m.t === 'pinged') expect('unavailable' in m).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an empty subs list ("nobody to ping") sends nothing and does not start the cooldown', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const a = new FakeConn('a');
+    await join(hub, a, DEV_A);
+    a.take();
+    await hub.handle(a, { t: 'ping', subs: [] });
+    expect(a.take()).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: false }]);
+    await hub.handle(a, { t: 'ping', subs: [SUB_A] });
+    expect(push.calls).toHaveLength(1);
+  });
+
+  it('pusher.send throwing still replies pinged (and handle resolves)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const push = new FakePusher();
+      push.error = new Error('down');
+      const hub = makeHub({ push });
+      const a = new FakeConn('a');
+      await join(hub, a, DEV_A);
+      a.take();
+      await expect(hub.handle(a, { t: 'ping', subs: [SUB_A] })).resolves.toBeUndefined();
+      expect(a.take()).toEqual([{ t: 'pinged', sent: 0, gone: [], limited: false }]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('subs are validated like announce (bad endpoint, too many, missing) -> bad_message', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const a = new FakeConn('a');
+    await join(hub, a, DEV_A);
+    a.take();
+    for (const subs of [
+      [{ ...SUB_A, endpoint: 'https://evil.example/x' }],
+      Array.from({ length: 6 }, (_, i) => ({ ...SUB_A, endpoint: `${FCM}${i}` })),
+      undefined,
+      'x',
+    ]) {
+      await hub.handle(a, { t: 'ping', subs });
+      expect(a.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+    }
+    expect(push.calls).toHaveLength(0);
+    // Extra fields are stripped before reaching the pusher
+    await hub.handle(a, { t: 'ping', subs: [{ ...SUB_A, extra: 1, keys: { ...SUB_A.keys, junk: 2 } }] });
+    expect(push.calls[0].subs).toEqual([SUB_A]);
+  });
+
+  it('not in a room -> not_in_room', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const c = new FakeConn('c');
+    await hub.handle(c, { t: 'ping', subs: [SUB_A] });
+    expect(c.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+    expect(push.calls).toHaveLength(0);
   });
 });

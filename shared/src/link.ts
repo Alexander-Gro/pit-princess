@@ -1,8 +1,10 @@
 // RadioLink: signaling socket + WebRTC peers + push-to-talk floor control.
 // Used by both the phone PWA and the desktop app; only the role differs.
 //
-// The PC is the hub: it keeps one RTCPeerConnection per phone. A phone has one, to the PC.
-// Every member (the PC and each phone) has an id from the server; the floor is held by an id.
+// Full mesh: every member keeps one RTCPeerConnection to every other member (at most 3 links:
+// PC <-> each phone and phone <-> phone), so the phones keep talking when the PC is off and
+// nothing has to switch when it comes or goes. Every member has an id from the server; the floor
+// is held by an id. Offers: the PC always offers; between phones, the lower member id does.
 
 import {
   PC_ID,
@@ -20,8 +22,11 @@ import { RX_TAIL_MS, type RadioFx } from './radio.ts';
 
 /** Keep the mic open briefly after PTT release so the last syllable isn't clipped. */
 export const TX_TAIL_MS = 150;
-/** A phone hearing the other phone gets audio relayed via the PC, which arrives later */
-export const RELAYED_RX_TAIL_MS = 450;
+
+/** Triple-press to ping: each press shorter than this... */
+export const PING_PRESS_MS = 400;
+/** ...and all three within this window */
+export const PING_WINDOW_MS = 1500;
 
 export type PeerStatus = 'none' | 'connecting' | 'connected' | 'failed';
 
@@ -38,9 +43,11 @@ export interface LinkState {
   selfId: MemberId | null;
   /** Everyone in the room, with names set by the PC */
   members: MemberInfo[];
-  /** Phone: the PC is in the room. PC: at least one phone is. */
+  /** Anyone else is in the room */
   peerPresent: boolean;
-  /** Summary: phone = its link to the PC; PC = the best of its phone links */
+  /** PC's setting: phones hear each other while the PC is in the room */
+  phonesHear: boolean;
+  /** Summary: the best of our links (connected if we can talk to anyone) */
   peer: PeerStatus;
   peers: PeerState[];
   floor: FloorHolder;
@@ -66,12 +73,14 @@ export interface RadioLinkOptions {
   accessKey?: string;
   /** Phone: stable device id (keeps its seat across reconnects) */
   device?: string;
+  /** Phone: the name it was last given, shown until the PC names it */
+  name?: string;
+  /** Phone: its id in the notification directory */
+  pushId?: string;
   fx: RadioFx;
   onChange?: (s: LinkState) => void;
   /** A peer's audio arrived (or went away: null). The app routes it to RadioFx/the mixer. */
   onRemoteStream?: (id: MemberId, stream: MediaStream | null) => void;
-  /** PC: the track to send to each phone (the relay mix). Without it the mic track is sent. */
-  sendTrackFor?: (id: MemberId) => MediaStreamTrack | null;
   /** JSON messages from a peer's data channel */
   onData?: (msg: unknown, from: MemberId) => void;
   /** Our data channel to a peer is open */
@@ -84,6 +93,10 @@ export interface RadioLinkOptions {
   onRoster?: (members: MemberInfo[]) => void;
   /** Result of announce(): push subscriptions the push service reported gone */
   onAnnounced?: (sent: number, gone: string[]) => void;
+  /** Result of a ping (triple-press or ping()) */
+  onPinged?: (sent: number, gone: string[], limited: boolean, unavailable: boolean) => void;
+  /** Who to ping: subscriptions of phones that aren't in the room (from the app's directory) */
+  pingTargets?: () => PushSub[];
 }
 
 interface Peer {
@@ -118,11 +131,15 @@ export class RadioLink {
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   private backoff = 1000;
   private stopped = false;
+  /** Triple-press detection */
+  private pressStart = 0;
+  private taps: number[] = [];
   private state: LinkState = {
     signaling: 'connecting',
     selfId: null,
     members: [],
     peerPresent: false,
+    phonesHear: true,
     peer: 'none',
     peers: [],
     floor: 'idle',
@@ -172,19 +189,23 @@ export class RadioLink {
     });
   }
 
-  /**
-   * Set (or swap) the local microphone track. It is only enabled while we transmit.
-   * On the PC with `sendTrackFor`, the mic feeds the relay mix instead of being sent directly.
-   */
+  /** Set (or swap) the local microphone track, sent to every peer. Only enabled while we transmit. */
   setMicTrack(track: MediaStreamTrack | null): void {
     this.micTrack = track;
     if (track) track.enabled = this.state.tx;
-    if (!this.opts.sendTrackFor) for (const p of this.peers.values()) this.replaceSendTrack(p, track);
+    for (const p of this.peers.values()) this.replaceSendTrack(p, track);
   }
 
-  /** PC: re-apply sendTrackFor() to every phone (e.g. after the mixer was rebuilt). */
-  refreshSendTracks(): void {
-    for (const p of this.peers.values()) this.replaceSendTrack(p, this.sendTrack(p.id));
+  /** "Get on the radio": push-notify the room's phones that aren't connected. False if offline. */
+  ping(): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN || !this.state.selfId) return false;
+    this.send({ t: 'ping', subs: this.opts.pingTargets?.() ?? [] });
+    return true;
+  }
+
+  /** PC: whether phones hear each other while the PC is here. */
+  setPhonesHear(on: boolean): void {
+    if (this.role === 'pc') this.send({ t: 'room_settings', phonesHear: on });
   }
 
   /** Ask the server for a 6-digit pairing code (PC only). Arrives via onPairCode. */
@@ -206,8 +227,8 @@ export class RadioLink {
     this.send({ t: 'kick', id });
   }
 
-  /** Display names by member id, including PC_ID for the PC itself (PC only). */
-  setNames(names: Record<MemberId, string>): void {
+  /** Display names by member id, including PC_ID for the PC itself; null clears a name (PC only). */
+  setNames(names: Record<MemberId, string | null>): void {
     if (this.role === 'pc') this.send({ t: 'names', names });
   }
 
@@ -224,7 +245,9 @@ export class RadioLink {
     return sent;
   }
 
-  pttDown(): void {
+  /** `synthetic`: re-keying by the app (not a human press), never counted towards a ping. */
+  pttDown(synthetic = false): void {
+    if (!synthetic && !this.pressStart) this.pressStart = Date.now();
     if (this.txWanted) return;
     this.txWanted = true;
     const self = this.state.selfId;
@@ -236,7 +259,9 @@ export class RadioLink {
     }
     if (!self || this.state.peer !== 'connected' || this.state.signaling !== 'open') {
       this.txWanted = false;
-      this.opts.fx.playBusy();
+      // Nobody to talk to: a soft tick rather than "busy" (the presses may be a ping)
+      if (this.state.signaling === 'open' && !this.state.peerPresent) this.opts.fx.playTick();
+      else this.opts.fx.playBusy();
       return;
     }
     if (this.state.floor === self) {
@@ -249,6 +274,7 @@ export class RadioLink {
 
   /** `immediate` skips the tail, e.g. when the page is being hidden and timers may not run. */
   pttUp(immediate = false): void {
+    this.countPress();
     if (!this.txWanted) return;
     this.txWanted = false;
     if (this.state.pending) {
@@ -288,7 +314,15 @@ export class RadioLink {
       this.send(
         this.role === 'pc'
           ? { t: 'host', v, room: this.opts.room, key }
-          : { t: 'join', v, room: this.opts.room, key, device: this.opts.device },
+          : {
+              t: 'join',
+              v,
+              room: this.opts.room,
+              key,
+              device: this.opts.device,
+              name: this.opts.name,
+              push: this.opts.pushId,
+            },
       );
     };
     ws.onmessage = (ev) => {
@@ -337,22 +371,25 @@ export class RadioLink {
         // Only a real welcome resets the backoff; "room full"/"no PC yet" keep backing off
         this.backoff = 1000;
         this.iceServers = msg.iceServers;
-        this.update({ selfId: msg.you, error: null });
+        this.update({ selfId: msg.you, error: null, phonesHear: msg.phonesHear !== false });
         this.setMembers(msg.members);
         this.forceFloor(msg.floor);
         // A floor still held under our id (e.g. after a reconnect) with PTT up would stay stuck
         if (msg.floor === msg.you && !this.txWanted) this.send({ t: 'floor_release' });
         this.opts.onWelcome?.(msg.members);
-        // The server told our peers peer_left when our old socket dropped, so they've torn down.
-        // Always start fresh calls, even if an old connection still looks alive.
-        this.dropGonePeers(msg.members);
-        if (this.role === 'pc') for (const m of msg.members) if (m.role === 'phone') void this.startCall(m.id);
+        // We have a new member id, so every old connection is dead: start over
+        for (const id of [...this.peers.keys()]) this.teardownPeer(id);
+        this.reconcile();
         break;
       }
       case 'roster':
+        this.update({ phonesHear: msg.phonesHear !== false });
         this.setMembers(msg.members);
-        this.dropGonePeers(msg.members);
+        this.reconcile();
         this.opts.onRoster?.(msg.members);
+        break;
+      case 'pinged':
+        this.opts.onPinged?.(msg.sent, msg.gone, msg.limited, msg.unavailable === true);
         break;
       case 'ice':
         this.iceServers = msg.iceServers;
@@ -364,7 +401,7 @@ export class RadioLink {
         this.opts.onPairCode?.(msg.code, msg.expiresInMs);
         break;
       case 'peer_joined':
-        if (this.role === 'pc') void this.startCall(msg.id);
+        // Peers follow the roster (see reconcile)
         break;
       case 'peer_left':
         this.teardownPeer(msg.id);
@@ -388,7 +425,12 @@ export class RadioLink {
           signaling: 'closed',
           peerPresent: false,
           members: [],
-          error: msg.reason === 'replaced' ? 'Opened somewhere else' : 'Disconnected by the PC',
+          error:
+            msg.reason === 'replaced'
+              ? 'Opened somewhere else'
+              : msg.reason === 'room_closed'
+                ? 'Room closed by the PC'
+                : 'Disconnected by the PC',
         });
         break;
       case 'error':
@@ -400,23 +442,56 @@ export class RadioLink {
             signaling: 'closed',
             error: msg.code === 'unauthorized' ? 'Wrong or missing access key' : 'App out of date: reload it',
           });
-        } else if (msg.code === 'no_host' || msg.code === 'room_full') {
-          // Not in yet: keep retrying quietly, and join once the PC is online / a seat frees up
+        } else if (msg.code === 'no_host' || msg.code === 'room_full' || msg.code === 'server_full') {
+          // Not in yet: keep retrying quietly, and join once a seat (or a room slot) frees up
           this.update({ peerPresent: false, members: [], error: msg.code === 'room_full' ? 'room_full' : null });
           this.ws?.close();
-        } else this.update({ error: msg.code });
+        } else console.warn('[link] server error', msg.code); // e.g. a refused message; not a link failure
         break;
     }
   }
 
-  /** Peers whose member left while we weren't told (e.g. our socket was down) are dead: drop them. */
-  private dropGonePeers(members: MemberInfo[]): void {
-    const ids = new Set(members.map((m) => m.id));
-    for (const id of [...this.peers.keys()]) if (!ids.has(id)) this.teardownPeer(id);
+  /** We offer to `id` (PC always; between phones, the lower member id), otherwise we answer. */
+  private weOffer(id: MemberId): boolean {
+    const self = this.state.selfId;
+    if (!self) return false;
+    if (self === PC_ID) return true;
+    if (id === PC_ID) return false;
+    return self < id;
+  }
+
+  /**
+   * Make our connections match the room: one to every other member. Drop links to members who
+   * left (even if we were never told, e.g. our socket was down), and call the ones we offer to.
+   */
+  private reconcile(): void {
+    const self = this.state.selfId;
+    if (!self) return;
+    const others = new Set(this.state.members.filter((m) => m.id !== self).map((m) => m.id));
+    for (const id of [...this.peers.keys()]) if (!others.has(id)) this.teardownPeer(id);
+    for (const id of others) if (!this.peers.has(id) && this.weOffer(id)) void this.startCall(id);
+  }
+
+  /** Count a human press that just ended; the third quick one in a row pings. */
+  private countPress(): void {
+    if (!this.pressStart) return;
+    const now = Date.now();
+    const short = now - this.pressStart < PING_PRESS_MS;
+    this.pressStart = 0;
+    if (!short) {
+      this.taps = [];
+      return;
+    }
+    this.taps = [...this.taps.filter((t) => now - t < PING_WINDOW_MS), now];
+    if (this.taps.length < 3) return;
+    this.taps = [];
+    if (this.ping()) this.opts.fx.playPingSent();
+    else this.opts.fx.playBusy();
   }
 
   private setMembers(members: MemberInfo[]): void {
-    const peerPresent = members.some((m) => (this.role === 'pc' ? m.role === 'phone' : m.role === 'pc'));
+    const self = this.state.selfId;
+    const peerPresent = members.some((m) => m.id !== self);
     this.update({ members, peerPresent, talker: this.talkerFor(this.state.floor, members) });
   }
 
@@ -457,9 +532,7 @@ export class RadioLink {
       this.opts.fx.openChannel();
       this.update({ rx: true });
     } else if (this.isOther(prev) && !this.isOther(holder)) {
-      // Another phone's voice reaches us through the PC, so it lags the floor message more
-      const relayed = this.role === 'phone' && prev !== PC_ID;
-      this.opts.fx.closeChannel(false, relayed ? RELAYED_RX_TAIL_MS : RX_TAIL_MS);
+      this.opts.fx.closeChannel(false, RX_TAIL_MS);
       this.update({ rx: false });
     }
   }
@@ -506,10 +579,6 @@ export class RadioLink {
 
   // ---- WebRTC ----
 
-  private sendTrack(id: MemberId): MediaStreamTrack | null {
-    return this.opts.sendTrackFor ? this.opts.sendTrackFor(id) : this.micTrack;
-  }
-
   private replaceSendTrack(p: Peer, track: MediaStreamTrack | null): void {
     const sender = p.pc.getTransceivers().find((t) => t.receiver.track.kind === 'audio')?.sender;
     if (sender) void sender.replaceTrack(track).catch((e) => console.warn('[link] replaceTrack', e));
@@ -542,11 +611,13 @@ export class RadioLink {
         peer.status = 'failed';
         peer.rttMs = null;
         peer.route = null;
-        // The PC drives the calls, so it retries; a phone waits for a new offer.
-        if (this.role === 'pc' && !peer.restartTimer) {
+        // The offering side starts a new call; the answering side asks it to.
+        if (!peer.restartTimer) {
           peer.restartTimer = setTimeout(() => {
             peer.restartTimer = null;
-            if (live() && this.state.members.some((m) => m.id === id)) void this.startCall(id);
+            if (!live() || !this.state.members.some((m) => m.id === id)) return;
+            if (this.weOffer(id)) void this.startCall(id);
+            else this.sendSignal(id, peer.cid, { kind: 'restart' });
           }, 1500);
         }
       } else if (cs === 'disconnected') peer.status = 'connecting';
@@ -556,8 +627,7 @@ export class RadioLink {
   }
 
   private sendSignal(to: MemberId, cid: string, data: SignalData): void {
-    // Phones always signal the PC; the server routes by their connection
-    this.send(this.role === 'pc' ? { t: 'signal', to, cid, data } : { t: 'signal', cid, data });
+    this.send({ t: 'signal', to, cid, data });
   }
 
   private attachChannel(peer: Peer, dc: RTCDataChannel): void {
@@ -588,7 +658,7 @@ export class RadioLink {
     try {
       const tr = pc.addTransceiver('audio', { direction: 'sendrecv' });
       this.attachChannel(peer, pc.createDataChannel('fx'));
-      await tr.sender.replaceTrack(this.sendTrack(id));
+      await tr.sender.replaceTrack(this.micTrack);
       if (this.peers.get(id) !== peer) return;
       const offer = await pc.createOffer();
       if (this.peers.get(id) !== peer) return;
@@ -602,8 +672,8 @@ export class RadioLink {
   private async onSignal(from: MemberId, cid: string, data: SignalData): Promise<void> {
     try {
       if (data.kind === 'offer') {
-        // Only the PC makes offers; a new one replaces any previous call
-        if (this.role !== 'phone' || from !== PC_ID) return;
+        // Only accept offers from members we answer to; a new one replaces any previous call
+        if (this.weOffer(from) || !this.state.members.some((m) => m.id === from)) return;
         const peer = this.newPeer(from, cid);
         const { pc } = peer;
         await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
@@ -619,11 +689,19 @@ export class RadioLink {
         this.sendSignal(from, cid, { kind: 'answer', sdp: answer.sdp ?? '' });
         return;
       }
+      if (data.kind === 'restart') {
+        // The answering side lost its connection: start a new call (if it's still ours to make)
+        const cur = this.peers.get(from);
+        if (this.weOffer(from) && (!cur || cur.cid === cid) && this.state.members.some((m) => m.id === from)) {
+          void this.startCall(from);
+        }
+        return;
+      }
       const peer = this.peers.get(from);
       // Signals for an older call attempt (or a peer we've dropped) are stale
       if (!peer || peer.cid !== cid) return;
       if (data.kind === 'answer') {
-        if (this.role !== 'pc' || peer.pc.signalingState !== 'have-local-offer') return;
+        if (!this.weOffer(from) || peer.pc.signalingState !== 'have-local-offer') return;
         await peer.pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
         await this.flushIce(peer);
       } else if (data.kind === 'ice') {
