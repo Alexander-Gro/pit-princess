@@ -49,7 +49,7 @@ function trySave(patch: Partial<Settings>): void {
 function createWindow(): void {
   win = new BrowserWindow({
     width: 1040,
-    height: 880,
+    height: 900,
     minWidth: 760,
     minHeight: 560,
     backgroundColor: '#0b0b0d',

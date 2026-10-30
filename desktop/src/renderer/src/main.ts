@@ -381,7 +381,7 @@ let announced = false;
 function pushHint(): string {
   const n = dir.liveCount();
   const alerts = n ? `"PC online" alerts: ${n} phone${n > 1 ? 's' : ''}. ` : '';
-  return `${alerts}Press your talk button 3 times quickly to ping phones that aren't on.`;
+  return `${alerts}Triple-press talk to ping phones that aren't on.`;
 }
 
 let pushSave: Promise<void> = Promise.resolve();
