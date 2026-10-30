@@ -138,6 +138,10 @@ async function populateDevices(): Promise<void> {
       o.textContent = d.deviceId === 'default' ? `System default` : d.label || 'Unnamed device';
       sel.appendChild(o);
     }
+    // Without any usable device (or before mic permission) the list is empty or unnamed
+    if (!list.some((d) => d.deviceId)) {
+      sel.replaceChildren(Object.assign(document.createElement('option'), { value: 'default', textContent: kind === 'audioinput' ? 'No microphone found' : 'System default' }));
+    }
     sel.value = list.some((d) => d.deviceId === current) ? current : 'default';
   };
   fill($('s-in'), 'audioinput', settings.inputDeviceId);
@@ -700,7 +704,9 @@ async function boot(): Promise<void> {
   try {
     await openMic(settings.inputDeviceId);
   } catch (e) {
-    $('v-server').textContent = `Microphone unavailable: ${e instanceof Error ? e.message : String(e)}`;
+    // Shown next to the mic picker; devicechange retries once a mic appears
+    $('v-mic').textContent = 'No microphone found. Plug in your headset (it reconnects automatically).';
+    console.warn('[mic] unavailable', e);
   }
   await populateDevices();
   joys = await pit.listJoysticks();
