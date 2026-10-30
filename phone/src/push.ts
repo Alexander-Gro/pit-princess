@@ -85,8 +85,8 @@ async function render(): Promise<void> {
     return;
   }
   chip.hidden = false;
-  if (Notification.permission === 'denied') chip.textContent = 'Notifications blocked in Settings';
-  else chip.textContent = (await usableSub()) ? 'PC alerts: on ✓' : 'Notify me when PC is online';
+  if (Notification.permission === 'denied') chip.textContent = 'Alerts blocked';
+  else chip.textContent = (await usableSub()) ? 'Alerts on' : 'Turn on alerts';
 }
 
 /** Make sure the directory has our current subscription (or "off"). Safe to call any time. */
@@ -129,7 +129,7 @@ function toggle(): Promise<void> {
   return (async () => {
     const existing = await usableSub();
     if (!existing) return subscribe();
-    if (!confirm('Stop notifications when the PC comes online?')) return;
+    if (!confirm('Turn off alerts?')) return;
     setOwn(null);
     await existing.unsubscribe().catch(() => {});
     await render();
@@ -153,7 +153,7 @@ export function initPush(publish: (sub: PushSub | null) => void, el: HTMLButtonE
   chip = el;
   el.addEventListener('click', () => {
     void toggle().catch((e) => {
-      el.textContent = 'Could not turn on notifications';
+      el.textContent = 'Alerts failed';
       console.warn('[push] subscribe failed', e);
     });
   });

@@ -3,7 +3,7 @@
 //
 // Headless Chromium has no push service, so PushManager is stubbed in the phone page (init script
 // below) to hand back a fake subscription. Everything after that is the real code path:
-// phone/src/push.ts -> RadioLink.sendData -> WebRTC data channel -> harness onData.
+// phone/src/push.ts -> RadioLink.shareDir -> server dir relay (v4; was the data channel) -> harness onDir.
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { randomBytes } from 'node:crypto';
 
@@ -89,12 +89,14 @@ async function openPair(
   await phone.goto(`${SERVER}/#room=${room}`);
   await phone.locator('#ptt').click();
   await expect.poll(async () => (await pcState(pc)).peer, { timeout: 20_000 }).toBe('connected');
-  await expect(phone.locator('#ptt-text')).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+  await expect(phone.locator('#ptt-text')).toHaveText('TALK', { timeout: 20_000 });
   return { pc, phone };
 }
 
-// (`from` is the phone's member id; with one phone it's always the same, so it's left out here)
-const pcData = (pc: Page) => pc.evaluate(() => window.pit.data.map(({ msg, valid }) => ({ msg, valid })));
+// v4: dir copies arrive via the server (from the phone's member id, or 'server' for its cache), not
+// the data channel. `from` is left out here.
+const pcData = (pc: Page) =>
+  pc.evaluate(() => window.pit.dirs.map(({ entries, valid }) => ({ msg: { t: 'dir', entries } as unknown, valid })));
 
 test.describe('mic is opened once per launch', () => {
   test('cycling the noise filter three times never calls getUserMedia again, and audio still flows', async ({ context }) => {
@@ -167,7 +169,7 @@ const lastEntry = async (pc: Page, owner: string) =>
   (await dirMsgs(pc)).flatMap((d) => d.msg.entries).filter((e) => e.owner === owner).sort((a, b) => b.ts - a.ts)[0] ?? null;
 const pushIdOf = (phone: Page) => phone.evaluate(() => localStorage.getItem('pit-princess-push-id'));
 
-test.describe('push subscription reaches the PC over the data channel (as the directory)', () => {
+test.describe('push subscription reaches the PC through the server (as the directory)', () => {
   test('an existing subscription is shared on connect as our own dir entry; every message passes isDirMsg', async ({ context }) => {
     const { pc, phone } = await openPair(context, { permission: 'granted', subscribed: true, fakeVapid: true });
     const owner = (await pushIdOf(phone))!;
@@ -200,13 +202,13 @@ test.describe('push subscription reaches the PC over the data channel (as the di
     const owner = (await pushIdOf(phone))!;
     const chip = phone.locator('#notify');
     await expect(chip).toBeVisible();
-    await expect(chip).toHaveText('Notify me when PC is online');
+    await expect(chip).toHaveText('Turn on alerts');
     expect(await lastEntry(pc, owner)).toBeNull();
 
     await chip.click();
     await expect.poll(async () => (await lastEntry(pc, owner))?.sub ?? null).toEqual(FAKE_SUB);
     const on = (await lastEntry(pc, owner))!;
-    await expect(chip).toHaveText('PC alerts: on ✓');
+    await expect(chip).toHaveText('Alerts on');
     expect(await phone.evaluate(() => (window as unknown as { __subscribeCalls: number }).__subscribeCalls)).toBe(1);
 
     phone.once('dialog', (d) => void d.accept());
@@ -214,7 +216,7 @@ test.describe('push subscription reaches the PC over the data channel (as the di
     await expect.poll(async () => { const e = await lastEntry(pc, owner); return e ? e.sub : 'missing'; }).toBeNull();
     expect((await lastEntry(pc, owner))!.ts).toBeGreaterThan(on.ts);
     expect((await dirMsgs(pc)).every((m) => m.valid)).toBe(true);
-    await expect(chip).toHaveText('Notify me when PC is online');
+    await expect(chip).toHaveText('Turn on alerts');
     expect(await phone.evaluate(() => (window as unknown as { __unsubscribed: number }).__unsubscribed)).toBe(1);
   });
 
@@ -226,7 +228,9 @@ test.describe('push subscription reaches the PC over the data channel (as the di
     await expect.poll(async () => (await pcState(pc))?.signaling).toBe('open');
     await pc.evaluate((s) => (window.pit.targets = [s]), FAKE_SUB);
     expect(await pc.evaluate(() => window.pit.ping())).toBe(true);
-    await expect.poll(() => pc.evaluate(() => window.pit.pinged)).toEqual([{ sent: 0, gone: [], limited: false, unavailable: true }]);
+    await expect
+      .poll(() => pc.evaluate(() => window.pit.pinged))
+      .toEqual([{ sent: 0, gone: [], limited: false, unavailable: true, failed: 0, waitMs: 0 }]);
   });
 
   test('PC announce round-trips through the real server (no VAPID keys: nothing sent)', async ({ context }) => {

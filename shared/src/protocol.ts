@@ -14,7 +14,7 @@ export const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 export const MAX_NAME_LEN = 24;
 
 /** Protocol version sent in host/join; older clients are told to update */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Member ids: 'pc', or a random id the server gives each phone connection */
 export const MEMBER_ID_RE = /^(pc|[A-Za-z0-9_-]{4,64})$/;
@@ -32,6 +32,10 @@ export interface MemberInfo {
   device?: string;
   /** Phones: opaque id for the "PC online"/ping directory (not the device id) */
   pushId?: string;
+  /** The app isn't on screen (backgrounded or locked): treat as gone for pings */
+  away?: boolean;
+  /** Changes on every app launch: a new value means a new instance, so old links are stale */
+  inst?: string;
 }
 
 export function isDeviceId(v: unknown): v is string {
@@ -151,10 +155,10 @@ export function isDirMsg(v: unknown): v is DirMsg {
 
 export type ClientMsg =
   /** `key` is the server's access key, required when the server sets ACCESS_KEY */
-  | { t: 'host'; v?: number; room: string; key?: string }
+  | { t: 'host'; v?: number; room: string; key?: string; inst?: string }
   /** `device` identifies the phone across reconnects (one slot per device) */
   /** `name`: the name this phone was last given (until the PC names it); `push`: its push id */
-  | { t: 'join'; v?: number; room: string; key?: string; device?: string; name?: string; push?: string }
+  | { t: 'join'; v?: number; room: string; key?: string; device?: string; name?: string; push?: string; inst?: string }
   /** `to` (PC only): the phone it's for. Phones always signal the PC. */
   | { t: 'signal'; to?: MemberId; cid: string; data: SignalData }
   | { t: 'floor_request' }
@@ -172,7 +176,13 @@ export type ClientMsg =
   /** Any member: "get on the radio" to these (absent) phones */
   | { t: 'ping'; subs: PushSub[] }
   /** PC: room-wide settings */
-  | { t: 'room_settings'; phonesHear: boolean };
+  | { t: 'room_settings'; phonesHear: boolean }
+  /** Keep-alive: the server answers with hb, so a dead connection is noticed quickly */
+  | { t: 'hb' }
+  /** Our app went to the background (away) or came back */
+  | { t: 'presence'; away: boolean }
+  /** Share the notification directory with the room (the server relays it, never stores it) */
+  | { t: 'dir'; entries: PushEntry[] };
 
 export type ErrorCode = 'bad_room' | 'no_host' | 'not_in_room' | 'bad_message' | 'unauthorized' | 'bad_code' | 'rate_limited' | 'room_full' | 'update_required' | 'server_full';
 
@@ -198,9 +208,22 @@ export type ServerMsg =
   | { t: 'pair_code'; code: string; expiresInMs: number }
   | { t: 'paired'; room: string; key: string }
   /** Result of an announce: subscriptions the push service says are gone (forget them) */
-  | { t: 'announced'; sent: number; gone: string[] }
+  | { t: 'announced'; sent: number; gone: string[]; failed?: number }
+  | { t: 'hb' }
+  /** Another member's copy of the notification directory */
+  | { t: 'dir'; from: MemberId; entries: PushEntry[] }
   /** Result of a ping; `limited` when it was refused for coming too soon */
-  | { t: 'pinged'; sent: number; gone: string[]; limited: boolean; unavailable?: boolean }
+  | {
+      t: 'pinged';
+      sent: number;
+      gone: string[];
+      limited: boolean;
+      unavailable?: boolean;
+      /** Deliveries the push service refused (not "gone"): e.g. a 403 */
+      failed?: number;
+      /** When limited: how long until pinging is allowed again */
+      waitMs?: number;
+    }
   /** Fresh TURN credentials for long sessions */
   | { t: 'ice'; iceServers: RTCIceServer[] }
   | { t: 'kicked'; reason: 'replaced' | 'room_closed' | 'kicked' }

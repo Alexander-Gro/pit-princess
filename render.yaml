@@ -15,6 +15,10 @@ services:
       # Use a long random string and enter the same key in the PC app.
       - key: ACCESS_KEY
         sync: false
+      # Contact for the push services; Apple requires a real one (mailto: or https:).
+      # Optional on Render (the service's https URL is used); set it when self-hosting elsewhere.
+      - key: VAPID_SUBJECT
+        sync: false
       # Push notifications ("PC is online" on the phone). Generate a pair with:
       #   npx web-push generate-vapid-keys
       - key: VAPID_PUBLIC_KEY

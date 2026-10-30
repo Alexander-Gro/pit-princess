@@ -1,6 +1,6 @@
 // End-to-end for v3: rooms that start from a phone, phone <-> phone with the PC off, the PC
-// joining and leaving the mesh, triple-press / chip pings, and the notification directory syncing
-// between phones over the data channels. Each phone has its OWN browser context.
+// joining and leaving the mesh, triple-press pings, and the notification directory syncing
+// between phones (v4: relayed and cached by the server). Each phone has its OWN browser context.
 import { expect, test } from '@playwright/test';
 import {
   connectedPcs,
@@ -45,11 +45,12 @@ test('two phones with no PC talk directly; the PC joins the mesh and leaves agai
     const b = await openPhone(browser, 'phoneB', room);
     phones.push(b);
     for (const p of [a, b]) {
-      await expect(p.link).toHaveText('PHONE ↔ PHONE', { timeout: 20_000 });
-      await expect(p.text).toHaveText('HOLD TO TALK');
+      await expect(p.link).toHaveText('PC OFF', { timeout: 20_000 });
+      await expect(p.text).toHaveText('TALK');
       expect(await connectedPcs(p)).toBe(1);
     }
-    await expect(a.sub).toHaveText('You: Phone 1 · with Phone 2 (PC off)');
+    await expect(a.sub).toHaveText('Phone 1');
+    await expect(b.sub).toHaveText('Phone 2');
     // The room really was made by a phone: no no_host anywhere
     expect([...a.frames, ...b.frames].some((f) => f.includes('no_host'))).toBe(false);
 
@@ -62,7 +63,7 @@ test('two phones with no PC talk directly; the PC joins the mesh and leaves agai
     await b.page.waitForTimeout(300);
     const txB = await phoneRate(b);
     await release(a);
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(b.text).toHaveText('TALK');
     console.log(`[p2p] no PC: B inbound bytes/s idle=${idleB} while A talks=${txB}`);
     expect(txB).toBeGreaterThan(idleB * 1.2);
 
@@ -87,7 +88,7 @@ test('two phones with no PC talk directly; the PC joins the mesh and leaves agai
     await b.page.waitForTimeout(300);
     const txB2 = await phoneRate(b);
     await release(a);
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(b.text).toHaveText('TALK');
     console.log(`[p2p] with PC: B idle=${idleB2} while A talks=${txB2}`);
     expect(txB2).toBeGreaterThan(idleB2 * 1.2);
 
@@ -98,7 +99,7 @@ test('two phones with no PC talk directly; the PC joins the mesh and leaves agai
     await a.page.waitForTimeout(300);
     const tx = await Promise.all([phoneRate(a), phoneRate(b)]);
     await pc.evaluate(() => window.pit.up());
-    for (const p of [a, b]) await expect(p.text).toHaveText('HOLD TO TALK');
+    for (const p of [a, b]) await expect(p.text).toHaveText('TALK');
     console.log(`[p2p] PC talks: A idle=${idle[0]} tx=${tx[0]}; B idle=${idle[1]} tx=${tx[1]}`);
     expect(tx[0]).toBeGreaterThan(idle[0] * 1.2);
     expect(tx[1]).toBeGreaterThan(idle[1] * 1.2);
@@ -107,9 +108,9 @@ test('two phones with no PC talk directly; the PC joins the mesh and leaves agai
     const totalBefore = await totalPcs(a);
     await pc.close();
     for (const p of [a, b]) {
-      await expect(p.link).toHaveText('PHONE ↔ PHONE', { timeout: 20_000 });
+      await expect(p.link).toHaveText('PC OFF', { timeout: 20_000 });
       await expect.poll(() => connectedPcs(p)).toBe(1);
-      await expect(p.text).toHaveText('HOLD TO TALK');
+      await expect(p.text).toHaveText('TALK');
     }
     expect(await totalPcs(a)).toBe(totalBefore); // no new call was needed
     const idleB3 = await phoneRate(b);
@@ -138,18 +139,18 @@ test('a phone holding the floor keeps it when the PC leaves', async ({ browser, 
     await expect(a.text).toHaveText('TX');
     await expect(b.text).toHaveText('RX');
     await pc.close();
-    await expect(b.link).toHaveText('PHONE ↔ PHONE', { timeout: 20_000 });
+    await expect(b.link).toHaveText('PC OFF', { timeout: 20_000 });
     // Still talking
     await expect(a.text).toHaveText('TX');
     await expect(b.text).toHaveText('RX');
     await release(a);
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(b.text).toHaveText('TALK');
   } finally {
     for (const p of phones) await p.context.close();
   }
 });
 
-test('a lone phone shows ALONE; triple-tap pings, a long press or a slow series does not; the chip pings', async ({ browser }) => {
+test('a lone phone shows ALONE; triple-tap pings, a long press or a slow series does not (v4: no Ping chip)', async ({ browser }) => {
   test.setTimeout(90_000);
   const room = newRoom();
   const phones: Phone[] = [];
@@ -157,9 +158,10 @@ test('a lone phone shows ALONE; triple-tap pings, a long press or a slow series 
     const a = await openPhone(browser, 'phoneA', room);
     phones.push(a);
     await expect(a.link).toHaveText('ALONE', { timeout: 20_000 });
-    await expect(a.text).toHaveText('WAITING');
-    const pingChip = a.page.locator('#ping');
-    await expect(pingChip).toBeVisible();
+    await expect(a.text).toHaveText('ALONE');
+    await expect(a.sub).toHaveText('');
+    // v4: the Ping chip is gone; triple-tap is the only way to ping
+    await expect(a.page.locator('#ping')).toHaveCount(0);
     const pings = () => sentOf(a, 'ping').length;
 
     // A long press: no ping
@@ -186,7 +188,7 @@ test('a lone phone shows ALONE; triple-tap pings, a long press or a slow series 
     await expect.poll(pings).toBe(1);
     expect(sentOf(a, 'ping')[0]).toEqual({ t: 'ping', subs: [] });
     // The e2e server has no VAPID keys
-    await expect(a.page.locator('#ping-msg')).toHaveText('Pinging isn’t set up on the server');
+    await expect(a.page.locator('#ping-msg')).toHaveText('Alerts not set up');
     await expect.poll(() => a.frames.some((f) => f.includes('"t":"pinged"') && f.includes('"unavailable":true'))).toBe(true);
     // The quick presses never reached the floor (nobody to talk to)
     expect(sentOf(a, 'floor_request')).toHaveLength(0);
@@ -196,9 +198,12 @@ test('a lone phone shows ALONE; triple-tap pings, a long press or a slow series 
     await a.page.waitForTimeout(500);
     expect(pings()).toBe(1);
 
-    // The Ping chip
+    // ...but another quick triple does
     await a.page.waitForTimeout(1600);
-    await pingChip.click();
+    for (let i = 0; i < 3; i++) {
+      await tap(a);
+      await a.page.waitForTimeout(80);
+    }
     await expect.poll(pings).toBe(2);
   } finally {
     for (const p of phones) await p.context.close();
@@ -212,7 +217,7 @@ test('triple-tap also pings while connected to the other phone (the blips key up
   try {
     for (const n of ['phoneA', 'phoneB']) phones.push(await openPhone(browser, n, room));
     const [a, b] = phones;
-    for (const p of phones) await expect(p.link).toHaveText('PHONE ↔ PHONE', { timeout: 20_000 });
+    for (const p of phones) await expect(p.link).toHaveText('PC OFF', { timeout: 20_000 });
     for (let i = 0; i < 3; i++) {
       await tap(a);
       await a.page.waitForTimeout(150);
@@ -220,8 +225,8 @@ test('triple-tap also pings while connected to the other phone (the blips key up
     await expect.poll(() => sentOf(a, 'ping').length).toBe(1);
     // Nothing for B to ping-wise: it got no ping traffic, and both end idle
     expect(sentOf(b, 'ping')).toHaveLength(0);
-    await expect(a.text).toHaveText('HOLD TO TALK');
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(a.text).toHaveText('TALK');
+    await expect(b.text).toHaveText('TALK');
   } finally {
     for (const p of phones) await p.context.close();
   }
@@ -276,9 +281,9 @@ test('the PC making a New code closes the room: phones show it, forget room/key/
     phones.push(a);
     await expect(a.link).toHaveText('ALONE', { timeout: 20_000 });
     if (ws.readyState !== WebSocket.OPEN) await new Promise((r) => ws.addEventListener('open', r, { once: true }));
-    ws.send(JSON.stringify({ t: 'host', v: 3, room }));
+    ws.send(JSON.stringify({ t: 'host', v: 4, room }));
     await expect.poll(() => got.some((m) => m.t === 'welcome')).toBe(true);
-    ws.send(JSON.stringify({ t: 'host', v: 3, room: newRoom() }));
+    ws.send(JSON.stringify({ t: 'host', v: 4, room: newRoom() }));
     await expect(a.text).toHaveText('OFFLINE', { timeout: 10_000 });
     await expect(a.sub).toHaveText('Room closed by the PC');
     const stored = () =>
@@ -321,26 +326,30 @@ test('the notification directory syncs between phones, and pings target absent o
     await expect(a.link).toHaveText('ALONE', { timeout: 20_000 });
     const b = await openPhone(browser, 'phoneB', room);
     phones.push(b);
-    await expect(b.link).toHaveText('PHONE ↔ PHONE', { timeout: 20_000 });
+    await expect(b.link).toHaveText('PC OFF', { timeout: 20_000 });
 
-    // B receives A's copy over the data channel and stores it under the same room key
+    // B receives A's copy (v4: relayed by the server) and stores it under the same room key
     const bDir = () => b.page.evaluate((k) => JSON.parse(localStorage.getItem(k) ?? '[]'), dirKey(room));
     await expect.poll(bDir, { timeout: 10_000 }).toContainEqual(entry);
 
     // B's ping goes to the absent owner's subscription (and not to A, who is here)
-    await b.page.locator('#ping').click();
+    for (let i = 0; i < 3; i++) {
+      await tap(b);
+      await b.page.waitForTimeout(150);
+    }
     await expect.poll(() => sentOf(b, 'ping').length).toBe(1);
     expect(sentOf(b, 'ping')[0]).toEqual({ t: 'ping', subs: [FAKE_SUB] });
 
-    // A PC joining later gets the directory too (valid dir messages from the phones)
+    // A PC joining later gets the directory too (v4: from the server's cache right after welcome,
+    // and from the phones' own copies, which they share on every welcome)
     const pc = await openPc(context, room);
     await expect
-      .poll(() =>
-        pc.evaluate((o) => window.pit.data.some((d) => d.valid && JSON.stringify(d.msg).includes(o)), FAKE_OWNER),
-        { timeout: 20_000 },
-      )
+      .poll(() => pc.evaluate((o) => window.pit.dirs.some((d) => d.from === 'server' && JSON.stringify(d.entries).includes(o)), FAKE_OWNER), {
+        timeout: 20_000,
+      })
       .toBe(true);
-    expect(await pc.evaluate(() => window.pit.data.every((d) => d.valid))).toBe(true);
+    // Nothing invalid arrives over the data channels (dir no longer travels there)
+    expect(await pc.evaluate(() => window.pit.data.filter((d) => d.valid).length)).toBe(0);
     // Each phone's own push id is in the roster, distinct from the absent owner
     const members = (await pcState(pc)).members.filter((m) => m.role === 'phone');
     expect(members.map((m) => m.pushId).sort()).toEqual([await pushIdOf(a), await pushIdOf(b)].sort());

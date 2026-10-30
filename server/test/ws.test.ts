@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { connect, createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import type { ServerMsg } from '@pit/shared';
 
@@ -38,6 +38,20 @@ async function waitHealthy(timeoutMs = 15_000): Promise<void> {
   throw new Error(`server did not come up:\n${output}`);
 }
 
+/**
+ * Every socket a test opens. A test that fails part-way would otherwise leave its sockets open, and
+ * since they all come from 127.0.0.1 they eat the per-IP cap (20) and make the cap tests fail too.
+ */
+const sockets = new Set<WebSocket>();
+afterEach(async () => {
+  const open = [...sockets].filter((ws) => ws.readyState !== WebSocket.CLOSED);
+  sockets.clear();
+  await Promise.all(
+    open.map((ws) => new Promise<void>((r) => (ws.once('close', () => r()), ws.terminate()))),
+  );
+  if (open.length) await new Promise((r) => setTimeout(r, 100)); // let the server see the closes
+});
+
 class Client {
   ws: WebSocket;
   msgs: ServerMsg[] = [];
@@ -45,6 +59,7 @@ class Client {
   closed: Promise<void>;
   constructor() {
     this.ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    sockets.add(this.ws);
     this.ws.on('message', (d) => {
       const m = JSON.parse(d.toString()) as ServerMsg;
       this.msgs.push(m);
@@ -135,16 +150,17 @@ describe('real server over WebSocket', () => {
     const phone = new Client();
     await Promise.all([pc.open(), phone.open()]);
 
-    pc.send({ t: 'host', v: 3, room: ROOM });
+    pc.send({ t: 'host', v: 4, room: ROOM });
     const w1 = await pc.next('welcome');
     expect(w1).toMatchObject({ role: 'pc', you: 'pc', floor: 'idle', members: [{ id: 'pc', role: 'pc', name: null }] });
     expect(Array.isArray(w1.iceServers) && w1.iceServers.length).toBeTruthy();
 
-    phone.send({ t: 'join', v: 3, room: ROOM, device: DEV_A });
+    phone.send({ t: 'join', v: 4, room: ROOM, device: DEV_A });
     const w2 = await phone.next('welcome');
     expect(w2).toMatchObject({ role: 'phone', floor: 'idle' });
     const id = w2.you;
-    expect(id).toMatch(/^m[A-Za-z0-9_-]{12}$/);
+    // v4: derived from (room, device) with the server's id secret
+    expect(id).toMatch(/^m[A-Za-z0-9_-]{16}$/);
     expect(w2.members).toEqual([
       { id: 'pc', role: 'pc', name: null },
       { id, role: 'phone', name: null, slot: 1 },
@@ -189,7 +205,7 @@ describe('real server over WebSocket', () => {
     // a new phone rejoins; PC still holds the floor
     const phone2 = new Client();
     await phone2.open();
-    phone2.send({ t: 'join', v: 3, room: ROOM, device: DEV_B });
+    phone2.send({ t: 'join', v: 4, room: ROOM, device: DEV_B });
     expect(await phone2.next('welcome')).toMatchObject({ floor: 'pc' });
     await pc.next('peer_joined');
     pc.close();
@@ -198,29 +214,68 @@ describe('real server over WebSocket', () => {
     phone2.close();
   });
 
-  it('same-device rejoin replaces the old socket: floor released, PC sees peer_left(old) then peer_joined(new)', async () => {
+  it('v4: same-device rejoin silently replaces the old socket: same id, floor released, PC sees only peer_joined', async () => {
     const room = 'wsReplaceRoom_0123456789';
     const pc = new Client();
     const a = new Client();
     const b = new Client();
     await Promise.all([pc.open(), a.open(), b.open()]);
-    pc.send({ t: 'host', v: 3, room });
+    pc.send({ t: 'host', v: 4, room });
     await pc.next('welcome');
-    a.send({ t: 'join', v: 3, room, device: DEV_A });
+    a.send({ t: 'join', v: 4, room, device: DEV_A });
     const oldId = (await a.next('welcome')).you;
     await pc.next('peer_joined');
     a.send({ t: 'floor_request' });
     await pc.next('floor');
-    b.send({ t: 'join', v: 3, room, device: DEV_A });
+    b.send({ t: 'join', v: 4, room, device: DEV_A });
     const newId = (await b.next('welcome')).you;
-    expect(newId).not.toBe(oldId);
+    expect(newId).toBe(oldId);
     expect(await a.next('kicked')).toEqual({ t: 'kicked', reason: 'replaced' });
     await a.closed;
     expect(await pc.next('floor')).toEqual({ t: 'floor', holder: 'idle' });
-    expect(await pc.next('peer_left')).toEqual({ t: 'peer_left', id: oldId });
     expect(await pc.next('peer_joined')).toEqual({ t: 'peer_joined', id: newId });
+    await settle();
+    expect(pc.msgs.filter((m) => m.t === 'peer_left')).toEqual([]);
     pc.close();
     b.close();
+  });
+
+  it('v4: hb is answered with hb, even before host/join', async () => {
+    const c = new Client();
+    await c.open();
+    c.send({ t: 'hb' });
+    expect(await c.next('hb')).toEqual({ t: 'hb' });
+    c.send({ t: 'join', v: 4, room: 'wsHbRoom_0123456789', device: DEV_A });
+    await c.next('welcome');
+    for (let i = 0; i < 3; i++) c.send({ t: 'hb' });
+    for (let i = 0; i < 3; i++) expect(await c.next('hb')).toEqual({ t: 'hb' });
+    c.close();
+    await c.closed;
+  });
+
+  it('v4: presence and dir over the real server: away shows in the roster, dir is relayed and cached for a newcomer', async () => {
+    const room = 'wsDirRoom_0123456789';
+    const a = new Client();
+    const b = new Client();
+    await Promise.all([a.open(), b.open()]);
+    a.send({ t: 'join', v: 4, room, device: DEV_A, push: 'pushAAAAAAAAAAAAAAAAAA', inst: 'inst-aaaa-0001' });
+    const wa = await a.next('welcome');
+    expect(wa.members).toEqual([{ id: wa.you, role: 'phone', name: null, slot: 1, pushId: 'pushAAAAAAAAAAAAAAAAAA', inst: 'inst-aaaa-0001' }]);
+    const entries = [{ owner: 'pushAAAAAAAAAAAAAAAAAA', sub: null, ts: 1 }];
+    a.send({ t: 'dir', entries });
+    a.send({ t: 'presence', away: true });
+    await waitFor(a, (m) => m.t === 'roster' && m.members.some((x) => x.id === wa.you && x.away === true));
+    b.send({ t: 'join', v: 4, room, device: DEV_B });
+    const wb = await b.next('welcome');
+    expect(wb.members.find((m) => m.id === wa.you)).toMatchObject({ away: true });
+    expect(await b.next('dir')).toEqual({ t: 'dir', from: 'server', entries });
+    b.send({ t: 'dir', entries: [{ owner: 'pushBBBBBBBBBBBBBBBBBB', sub: null, ts: 2 }] });
+    expect(await a.next('dir')).toEqual({ t: 'dir', from: wb.you, entries: [{ owner: 'pushBBBBBBBBBBBBBBBBBB', sub: null, ts: 2 }] });
+    await settle();
+    expect(b.msgs.filter((m) => m.t === 'dir')).toEqual([]); // not echoed to the sender
+    a.close();
+    b.close();
+    await Promise.all([a.closed, b.closed]);
   });
 
   it('two phones fit, a third gets room_full over a socket that stays open, and gets in when a seat frees', async () => {
@@ -230,14 +285,14 @@ describe('real server over WebSocket', () => {
     const b = new Client();
     const c = new Client();
     await Promise.all([pc.open(), a.open(), b.open(), c.open()]);
-    pc.send({ t: 'host', v: 3, room });
+    pc.send({ t: 'host', v: 4, room });
     await pc.next('welcome');
-    a.send({ t: 'join', v: 3, room, device: DEV_A });
+    a.send({ t: 'join', v: 4, room, device: DEV_A });
     const aId = (await a.next('welcome')).you;
-    b.send({ t: 'join', v: 3, room, device: DEV_B });
+    b.send({ t: 'join', v: 4, room, device: DEV_B });
     const bw = await b.next('welcome');
     expect(bw.members.map((m) => m.slot ?? 0)).toEqual([0, 1, 2]);
-    c.send({ t: 'join', v: 3, room, device: DEV_C });
+    c.send({ t: 'join', v: 4, room, device: DEV_C });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'room_full' });
     await settle();
     expect(c.ws.readyState).toBe(WebSocket.OPEN);
@@ -250,7 +305,7 @@ describe('real server over WebSocket', () => {
     expect(await pc.next('signal')).toEqual({ t: 'signal', from: aId, cid: 'cid-0003', data: { kind: 'restart' } });
     pc.send({ t: 'kick', id: aId });
     await a.closed;
-    c.send({ t: 'join', v: 3, room, device: DEV_C });
+    c.send({ t: 'join', v: 4, room, device: DEV_C });
     const cw = await c.next('welcome');
     expect(cw.members.find((m) => m.id === cw.you)?.slot).toBe(1);
     expect(pc.msgs.filter((m) => m.t === 'signal')).toEqual([]);
@@ -275,7 +330,7 @@ describe('real server over WebSocket', () => {
     await c.closed;
     const c2 = new Client();
     await c2.open();
-    c2.send({ t: 'join', v: 3, room: 'short' });
+    c2.send({ t: 'join', v: 4, room: 'short' });
     expect(await c2.next('error')).toEqual({ t: 'error', code: 'bad_room' });
     c2.send({ t: 'floor_request' });
     expect(await c2.next('error')).toEqual({ t: 'error', code: 'not_in_room' });
@@ -287,10 +342,10 @@ describe('real server over WebSocket', () => {
     const a = new Client();
     const b = new Client();
     await Promise.all([a.open(), b.open()]);
-    a.send({ t: 'join', v: 3, room, device: DEV_A, name: 'Emma', push: 'pushAAAAAAAAAAAAAAAAAA' });
+    a.send({ t: 'join', v: 4, room, device: DEV_A, name: 'Emma', push: 'pushAAAAAAAAAAAAAAAAAA' });
     const wa = await a.next('welcome');
     expect(wa).toMatchObject({ role: 'phone', phonesHear: true, members: [{ role: 'phone', name: 'Emma', slot: 1, pushId: 'pushAAAAAAAAAAAAAAAAAA' }] });
-    b.send({ t: 'join', v: 3, room, device: DEV_B });
+    b.send({ t: 'join', v: 4, room, device: DEV_B });
     const wb = await b.next('welcome');
     expect(wb.members.map((m) => m.id)).toEqual([wa.you, wb.you]);
     await waitFor(a, (m) => m.t === 'roster' && m.members.length === 2);
@@ -307,7 +362,7 @@ describe('real server over WebSocket', () => {
   it('rejects a bad room code', async () => {
     const c = new Client();
     await c.open();
-    c.send({ t: 'join', v: 3, room: 'short' });
+    c.send({ t: 'join', v: 4, room: 'short' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'bad_room' });
     c.send({ t: 'floor_request' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'not_in_room' });
@@ -327,6 +382,7 @@ describe('real server over WebSocket', () => {
     const connectStatus = (): Promise<{ ok: true; ws: WebSocket } | { ok: false; status: number | null }> =>
       new Promise((resolve) => {
         const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+        sockets.add(ws);
         ws.once('open', () => resolve({ ok: true, ws }));
         ws.once('unexpected-response', (_req, res) => resolve({ ok: false, status: res.statusCode ?? null }));
         ws.once('error', () => resolve({ ok: false, status: null }));

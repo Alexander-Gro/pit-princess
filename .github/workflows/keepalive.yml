@@ -1,0 +1,21 @@
+# Keeps a free Render server awake, so the radio doesn't wait ~1 minute for a cold start.
+# Opt-in: add a repository secret KEEPALIVE_URL with your server's address
+# (e.g. https://your-app.onrender.com). Without it, this does nothing.
+name: Keep server awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /healthz
+        env:
+          URL: ${{ secrets.KEEPALIVE_URL }}
+        run: |
+          if [ -z "$URL" ]; then echo "KEEPALIVE_URL not set, skipping"; exit 0; fi
+          curl -fsS --max-time 90 "${URL%/}/healthz" && echo " (awake)"

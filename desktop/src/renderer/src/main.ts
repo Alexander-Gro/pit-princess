@@ -10,10 +10,10 @@ import {
   MAX_PHONES,
   PC_ID,
   PushDirectory,
-  isDirMsg,
   RadioFx,
   RadioLink,
   RemoteAudio,
+  pingText,
   type MemberInfo,
   type RadioFxSettings,
   RevLights,
@@ -155,7 +155,7 @@ async function applyCrewChief(res: CrewChiefResult): Promise<void> {
   }
   const loaded = await fx.loadSounds(buffers);
   const ok = loaded.length > 0 && res.missing.length === 0;
-  $('v-cc').textContent = ok ? 'LOADED ✓' : loaded.length ? `PARTIAL (${loaded.length}/4)` : 'NOT FOUND — using built-in';
+  $('v-cc').textContent = ok ? 'LOADED' : loaded.length ? `PARTIAL (${loaded.length}/4)` : 'BUILT-IN';
   $('t-cc').className = `tile cc${ok ? '' : ' flag-amber'}`;
   $('v-cc-path').textContent = res.folder ?? 'Point this at your CrewChiefV4\\Sounds folder';
   sendSoundsToPhone();
@@ -190,21 +190,21 @@ function startLink(): void {
       if (node) fx.addRemote(id, node);
       else fx.removeRemote(id);
     },
-    onDataOpen: (id) => {
-      sendSoundsToPhone(id);
-      link?.sendData({ t: 'dir', entries: dir.toJSON() }, id);
-    },
+    onDataOpen: (id) => sendSoundsToPhone(id),
     onPairCode: showPairCode,
-    onData: onPhoneMessage,
-    pingTargets: () => dir.absent(link?.getState().members.map((m) => m.pushId) ?? []),
+    onDir: (entries) => {
+      if (dir.merge(entries)) dirChanged();
+    },
+    pingTargets: () => dir.absent(activePushIds(link?.getState().members ?? [])),
     onWelcome: (members) => {
       sentNames = '';
       sendNames(members);
       link?.setPhonesHear(settings.relayPhones);
+      link?.shareDir(dir.toJSON());
       // "PC is online" goes out once per app launch, not on every reconnect, and only to phones
-      // that aren't already here
+      // that aren't here with the app open
       if (announced) return;
-      const subs = dir.absent(members.map((m) => m.pushId));
+      const subs = dir.absent(activePushIds(members));
       if (!subs.length || link?.announce(subs)) announced = true;
     },
     onRoster: (members) => sendNames(members),
@@ -212,15 +212,9 @@ function startLink(): void {
       if (gone.length) forgetEndpoints(gone);
       $('v-push').textContent = sent ? `Notified ${sent} phone${sent > 1 ? 's' : ''} that the PC is online.` : pushHint();
     },
-    onPinged: (sent, gone, limited, unavailable) => {
-      if (gone.length) forgetEndpoints(gone);
-      $('v-push').textContent = unavailable
-        ? 'Pinging needs notifications set up on the server (VAPID keys).'
-        : limited
-        ? 'Pinged a moment ago. Wait 30 seconds before pinging again.'
-        : sent
-          ? `Pinged ${sent} phone${sent > 1 ? 's' : ''}.`
-          : 'Nobody to ping: every phone with alerts on is already here.';
+    onPinged: (r) => {
+      if (r.gone.length) forgetEndpoints(r.gone);
+      $('v-push').textContent = pingText(r);
     },
   });
   const track = tx?.track ?? null;
@@ -265,6 +259,7 @@ function render(s: LinkState): void {
     $('v-server').textContent = s.error;
   } else if (s.signaling !== 'open') setTile('link', 'SERVER…', 'amber');
   else if (!phones.length) setTile('link', 'NO PHONE', null);
+  else if (connected && connected < phones.length) setTile('link', 'PARTIAL', 'amber');
   else if (connected) setTile('link', connected > 1 ? `${connected} PHONES` : 'CONNECTED', 'green');
   else if (s.peer === 'failed') setTile('link', 'FAILED', 'red');
   else setTile('link', 'LINKING', 'amber');
@@ -341,7 +336,15 @@ function renderPhones(s: LinkState): void {
     const peer = s.peers.find((p) => p.id === m.id);
     const status = row.querySelector<HTMLElement>('.status')!;
     status.textContent =
-      peer?.status === 'connected' ? (peer.rttMs != null ? `${peer.rttMs} ms` : 'connected') : peer?.status === 'failed' ? 'failed' : 'linking…';
+      m.away
+        ? 'away'
+        : peer?.status === 'connected'
+          ? peer.rttMs != null
+            ? `${peer.rttMs} ms`
+            : 'connected'
+          : peer?.status === 'failed'
+            ? 'failed'
+            : 'linking';
     status.classList.toggle('ok', peer?.status === 'connected');
     row.classList.toggle('talking', s.floor === m.id);
   }
@@ -397,10 +400,15 @@ function saveDir(): Promise<void> {
   return pushSave;
 }
 
-/** Changes spread to every phone, so everyone's copy stays current. */
+/** Changes spread to every phone (via the server), so everyone's copy stays current. */
 function dirChanged(): void {
   void saveDir();
-  link?.sendData({ t: 'dir', entries: dir.toJSON() });
+  link?.shareDir(dir.toJSON());
+}
+
+/** Push ids of phones here with the app on screen; any other phone can be pinged */
+function activePushIds(members: MemberInfo[]): (string | undefined)[] {
+  return members.filter((m) => !m.away).map((m) => m.pushId);
 }
 
 /** The push service says these endpoints are gone: mark them off for everyone. */
@@ -408,9 +416,7 @@ function forgetEndpoints(endpoints: string[]): void {
   if (dir.dropEndpoints(endpoints)) dirChanged();
 }
 
-function onPhoneMessage(msg: unknown): void {
-  if (isDirMsg(msg) && dir.merge(msg.entries)) dirChanged();
-}
+
 
 // ---------- pairing code ----------
 
@@ -708,6 +714,8 @@ async function boot(): Promise<void> {
   dir = new PushDirectory(settings.pushDir);
   $('v-push').textContent = pushHint();
   startLink();
+  // Network back (laptop woke up, Wi-Fi reconnected): reconnect now rather than after the backoff
+  window.addEventListener('online', () => link?.nudge());
   await applyCrewChief(await pit.loadCrewChief());
   requestAnimationFrame(meterLoop);
 }

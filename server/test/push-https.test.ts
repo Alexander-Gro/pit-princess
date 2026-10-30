@@ -48,7 +48,7 @@ function realSub(path: string) {
 }
 
 describe('createPusher + real web-push', () => {
-  it('201 is sent, 404/410 are gone, 500 and 429 are neither', async () => {
+  it('201 is sent, 404/410 are gone, 500 and 429 are failed (v4)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const vapid = webpush.generateVAPIDKeys();
@@ -61,6 +61,7 @@ describe('createPusher + real web-push', () => {
       const res = await pusher!.send(subs, { title: 'Pit Princess', body: 'The PC is online.' });
       expect(res.sent).toBe(1);
       expect([...res.gone].sort()).toEqual([`${base}/404/c`, `${base}/410/b`]);
+      expect(res.failed).toBe(2);
       expect(warn.mock.calls.map((c) => c[1]).sort()).toEqual([429, 500]);
 
       // Every request was a real encrypted VAPID push with our TTL/urgency
@@ -83,7 +84,7 @@ describe('createPusher + real web-push', () => {
       const vapid = webpush.generateVAPIDKeys();
       const { pusher } = createPusher({ VAPID_PUBLIC_KEY: vapid.publicKey, VAPID_PRIVATE_KEY: vapid.privateKey }, 'https://x.test');
       const res = await pusher!.send([{ endpoint: `${base}/201/z`, keys: { p256dh: 'short', auth: 'short' } }], {});
-      expect(res).toEqual({ sent: 0, gone: [] });
+      expect(res).toEqual({ sent: 0, gone: [], failed: 1 });
       expect(warn).toHaveBeenCalled();
     } finally {
       warn.mockRestore();

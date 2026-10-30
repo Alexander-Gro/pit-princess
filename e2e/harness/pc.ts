@@ -3,7 +3,7 @@
 // RemoteAudio source per phone into RadioFx (what the PC hears), and the mic goes straight to
 // every peer with setMicTrack (each phone gets its own audio from the other phone directly).
 // Not part of any production build. Query params: ws=<signaling url>&room=<code>
-import { RadioFx, RadioLink, RemoteAudio, isDirMsg, type LinkState, type PushSub } from '@pit/shared';
+import { RadioFx, RadioLink, RemoteAudio, isDirMsg, type LinkState, type PingResult, type PushEntry, type PushSub } from '@pit/shared';
 
 declare global {
   interface Window {
@@ -29,6 +29,8 @@ declare global {
       txBytes(id?: string): Promise<number>;
       /** Data channel messages from the phones, and whether each passed isDirMsg (what the PC app checks) */
       data: { msg: unknown; valid: boolean; from: string }[];
+      /** v4: directory copies relayed by the server (from a member id, or 'server' for its cache) */
+      dirs: { entries: PushEntry[]; from: string; valid: boolean }[];
       dataOpenCount: number;
       /** Send {t:'announce'} to the server; replies land in `announced` */
       announce(subs: PushSub[]): boolean;
@@ -36,10 +38,12 @@ declare global {
       /** RadioLink.ping(); replies land in `pinged`. `targets` is what pingTargets() returns. */
       ping(): boolean;
       targets: PushSub[];
-      pinged: { sent: number; gone: string[]; limited: boolean; unavailable?: boolean }[];
+      pinged: PingResult[];
       pingSentCount: number;
       /** Close the link (the PC goes offline) */
       stop(): void;
+      /** Start the link again after stop() (the PC comes back online) */
+      start(): void;
     };
   }
 }
@@ -79,6 +83,7 @@ const pit: Window['pit'] = {
   setNames: (names) => link?.setNames(names as Record<string, string>),
   setPhonesHear: (on) => link?.setPhonesHear(on),
   data: [],
+  dirs: [],
   dataOpenCount: 0,
   announce: (subs) => link?.announce(subs) ?? false,
   announced: [],
@@ -87,6 +92,7 @@ const pit: Window['pit'] = {
   pinged: [],
   pingSentCount: 0,
   stop: () => link?.stop(),
+  start: () => link?.start(),
   rxBytes: (id) => rtpBytes(id, 'inbound-rtp'),
   txBytes: (id) => rtpBytes(id, 'outbound-rtp'),
 };
@@ -132,10 +138,11 @@ async function main(): Promise<void> {
       pit.remoteTrack = pit.remotes.length > 0;
     },
     onData: (msg, from) => pit.data.push({ msg, valid: isDirMsg(msg), from }),
+    onDir: (entries, from) => pit.dirs.push({ entries, from, valid: isDirMsg({ t: 'dir', entries }) }),
     onDataOpen: () => pit.dataOpenCount++,
     onAnnounced: (sent, gone) => pit.announced.push({ sent, gone }),
     pingTargets: () => pit.targets,
-    onPinged: (sent, gone, limited, unavailable) => pit.pinged.push({ sent, gone, limited, ...(unavailable ? { unavailable } : {}) }),
+    onPinged: (r) => pit.pinged.push(r),
   });
   // As on the desktop: the mic goes to every peer; the link keeps it muted unless we transmit
   link.setMicTrack(track);

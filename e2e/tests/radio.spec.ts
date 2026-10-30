@@ -35,7 +35,7 @@ test('phone and PC connect, key up, get busy, and release', async ({ context }) 
 
   // Both sides reach a connected WebRTC peer
   await expect.poll(async () => (await pcState(pc)).peer, { timeout: 20_000 }).toBe('connected');
-  await expect(pttText).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+  await expect(pttText).toHaveText('TALK', { timeout: 20_000 });
   await expect(phone.locator('#v-link')).toHaveText('CONNECTED');
   await expect.poll(() => pc.evaluate(() => window.pit.remoteTrack)).toBe(true);
 
@@ -56,7 +56,7 @@ test('phone and PC connect, key up, get busy, and release', async ({ context }) 
   await pc.evaluate(() => window.pit.up());
   await expect.poll(async () => (await pcState(pc)).floor).toBe('idle');
   expect(await pcState(pc)).toMatchObject({ tx: false, rx: false });
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
 
   // Phone mic track is disabled while idle, so Opus only sends tiny silence frames.
   // (Headless Chromium has no audio output, so audioLevel/totalAudioEnergy stay 0; compare bytes.)
@@ -72,7 +72,8 @@ test('phone and PC connect, key up, get busy, and release', async ({ context }) 
   // The floor holder is the phone's server-assigned member id
   const s = await pc.evaluate(() => window.pit.state!);
   const phoneId = s.members.find((m) => m.role === 'phone')!.id;
-  expect(phoneId).toMatch(/^m[A-Za-z0-9_-]{12}$/);
+  // v4: derived from the phone's device id (stable across reconnects)
+  expect(phoneId).toMatch(/^m[A-Za-z0-9_-]{16}$/);
   expect(s.floor).toBe(phoneId);
   // ...and the fake mic's tone actually reaches the PC while transmitting (higher bitrate than encoded silence) (much higher bitrate)
   const tx0 = await energy();
@@ -91,7 +92,7 @@ test('phone and PC connect, key up, get busy, and release', async ({ context }) 
 
   // Phone releases: idle again
   await phone.mouse.up();
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
   await expect.poll(async () => (await pcState(pc)).floor).toBe('idle');
   expect(await pcState(pc)).toMatchObject({ rx: false, tx: false, peer: 'connected' });
 });
@@ -107,7 +108,7 @@ async function connectPair(context: import('@playwright/test').BrowserContext) {
   await phone.locator('#ptt').click();
   await expect.poll(async () => (await pcState(pc)).peer, { timeout: 20_000 }).toBe('connected');
   const pttText = phone.locator('#ptt-text');
-  await expect(pttText).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+  await expect(pttText).toHaveText('TALK', { timeout: 20_000 });
   return { pc, phone, pttText, harnessUrl };
 }
 
@@ -119,7 +120,7 @@ test('a tap released before the grant arrives does not leave the floor stuck', a
     window.pit.up(true);
   });
   await expect.poll(async () => (await pcState(pc)).floor).toBe('idle');
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
   expect(await pcState(pc)).toMatchObject({ tx: false, pending: false });
   // and the floor is really free: the phone can key up
   await pttText.hover();
@@ -127,7 +128,7 @@ test('a tap released before the grant arrives does not leave the floor stuck', a
   await phone.mouse.down();
   await expect(pttText).toHaveText('TX');
   await phone.mouse.up();
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
 });
 
 test('pttUp(true) ends TX without the tail', async ({ context }) => {
@@ -139,19 +140,19 @@ test('pttUp(true) ends TX without the tail', async ({ context }) => {
     return window.pit.state!.tx;
   });
   expect(t).toBe(false);
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
 });
 
 test('PC reload re-establishes the call with the waiting phone', async ({ context }) => {
   const { pc, phone, pttText, harnessUrl } = await connectPair(context);
   await pc.goto('about:blank');
-  await expect(pttText).not.toHaveText('HOLD TO TALK', { timeout: 10_000 });
+  await expect(pttText).not.toHaveText('TALK', { timeout: 10_000 });
   await pc.goto(harnessUrl);
   await expect.poll(async () => (await pcState(pc))?.peer, { timeout: 20_000 }).toBe('connected');
-  await expect(pttText).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+  await expect(pttText).toHaveText('TALK', { timeout: 20_000 });
   await pc.evaluate(() => window.pit.down());
   await expect(pttText).toHaveText('RX');
   await pc.evaluate(() => window.pit.up());
-  await expect(pttText).toHaveText('HOLD TO TALK');
+  await expect(pttText).toHaveText('TALK');
   void phone;
 });

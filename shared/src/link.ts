@@ -13,6 +13,7 @@ import {
   type FloorHolder,
   type MemberId,
   type MemberInfo,
+  type PushEntry,
   type PushSub,
   type Role,
   type ServerMsg,
@@ -22,6 +23,18 @@ import { RX_TAIL_MS, type RadioFx } from './radio.ts';
 
 /** Keep the mic open briefly after PTT release so the last syllable isn't clipped. */
 export const TX_TAIL_MS = 150;
+
+/** Keep-alive: we send hb this often; no word from the server for HB_DEAD_MS means the socket is dead */
+const HB_INTERVAL_MS = 5_000;
+const HB_DEAD_MS = 12_000;
+/** A member that vanished from the roster keeps its working link this long, in case it's a blip */
+const GONE_GRACE_MS = 4_000;
+/** A link that isn't up this long after starting is restarted */
+const CONNECT_WATCHDOG_MS = 15_000;
+/** The server answers a talk press almost instantly; silence this long means the socket is dead */
+const FLOOR_ANSWER_MS = 2_500;
+/** An ICE link stuck in 'disconnected' this long is restarted rather than waiting for 'failed' */
+const DISCONNECTED_RESTART_MS = 5_000;
 
 /** Triple-press to ping: each press shorter than this... */
 export const PING_PRESS_MS = 400;
@@ -49,6 +62,8 @@ export interface LinkState {
   phonesHear: boolean;
   /** Summary: the best of our links (connected if we can talk to anyone) */
   peer: PeerStatus;
+  /** Every other member has a working link (otherwise someone can't hear us) */
+  allConnected: boolean;
   peers: PeerState[];
   floor: FloorHolder;
   /** We hold the floor and the mic is live. */
@@ -62,6 +77,25 @@ export interface LinkState {
   rttMs: number | null;
   route: 'direct' | 'relay' | null;
   error: string | null;
+}
+
+export interface PingResult {
+  sent: number;
+  gone: string[];
+  limited: boolean;
+  unavailable: boolean;
+  /** Refused by the push service (not just expired) */
+  failed: number;
+  waitMs: number;
+}
+
+/** Short status text for a ping result */
+export function pingText(r: PingResult): string {
+  if (r.unavailable) return 'Alerts not set up';
+  if (r.limited) return `Wait ${Math.max(1, Math.ceil(r.waitMs / 1000))} s`;
+  if (r.sent) return r.failed ? `Pinged ${r.sent}, ${r.failed} failed` : `Pinged ${r.sent}`;
+  if (r.failed) return 'Alert failed';
+  return 'Nobody to ping';
 }
 
 export interface RadioLinkOptions {
@@ -94,9 +128,11 @@ export interface RadioLinkOptions {
   /** Result of announce(): push subscriptions the push service reported gone */
   onAnnounced?: (sent: number, gone: string[]) => void;
   /** Result of a ping (triple-press or ping()) */
-  onPinged?: (sent: number, gone: string[], limited: boolean, unavailable: boolean) => void;
+  onPinged?: (r: PingResult) => void;
   /** Who to ping: subscriptions of phones that aren't in the room (from the app's directory) */
   pingTargets?: () => PushSub[];
+  /** Another member's copy of the notification directory (relayed by the server) */
+  onDir?: (entries: PushEntry[], from: MemberId) => void;
 }
 
 interface Peer {
@@ -110,6 +146,14 @@ interface Peer {
   rttMs: number | null;
   route: 'direct' | 'relay' | null;
   restartTimer: ReturnType<typeof setTimeout> | null;
+  /** Restart if still 'disconnected' when this fires */
+  disconnectTimer: ReturnType<typeof setTimeout> | null;
+  /** Its member left the roster; drop the link when this fires unless it comes back */
+  goneTimer: ReturnType<typeof setTimeout> | null;
+  /** Restarts the link if it hasn't connected in time */
+  watchdog: ReturnType<typeof setTimeout> | null;
+  /** The remote app instance this link was made with */
+  inst: string | undefined;
 }
 
 function newCallId(): string {
@@ -129,6 +173,9 @@ export class RadioLink {
   private releaseTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  private hbTimer: ReturnType<typeof setInterval> | null = null;
+  private lastFromServer = 0;
+  private away = false;
   private backoff = 1000;
   private stopped = false;
   /** Triple-press detection */
@@ -141,6 +188,7 @@ export class RadioLink {
     peerPresent: false,
     phonesHear: true,
     peer: 'none',
+    allConnected: false,
     peers: [],
     floor: 'idle',
     tx: false,
@@ -151,6 +199,9 @@ export class RadioLink {
     route: null,
     error: null,
   };
+
+  /** This app instance; a new launch gets a new one so others drop their old links to us */
+  private inst = newCallId();
 
   constructor(opts: RadioLinkOptions) {
     this.opts = opts;
@@ -172,7 +223,8 @@ export class RadioLink {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.releaseTimer) clearTimeout(this.releaseTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
-    this.reconnectTimer = this.releaseTimer = this.statsTimer = null;
+    if (this.hbTimer) clearInterval(this.hbTimer);
+    this.reconnectTimer = this.releaseTimer = this.statsTimer = this.hbTimer = null;
     this.ws?.close();
     this.ws = null;
     for (const id of [...this.peers.keys()]) this.teardownPeer(id);
@@ -201,6 +253,40 @@ export class RadioLink {
     if (this.ws?.readyState !== WebSocket.OPEN || !this.state.selfId) return false;
     this.send({ t: 'ping', subs: this.opts.pingTargets?.() ?? [] });
     return true;
+  }
+
+  /**
+   * The network may have changed (came back online, app back on screen): reconnect right away
+   * instead of waiting out the backoff, or check that the socket is still alive.
+   */
+  nudge(dead = false): void {
+    if (this.stopped) return;
+    // Nothing from the server for a while (e.g. we were suspended): the socket is likely dead
+    const stale =
+      this.ws?.readyState === WebSocket.OPEN && (dead || Date.now() - this.lastFromServer > HB_INTERVAL_MS * 1.5);
+    if (stale) {
+      const ws = this.ws!;
+      ws.close();
+      ws.onclose?.(new CloseEvent('close'));
+    }
+    if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.backoff = 1000;
+      this.connect();
+    } else this.send({ t: 'hb' });
+  }
+
+  /** Our app is in the background (away) or on screen again; pings treat away phones as gone. */
+  setAway(away: boolean): void {
+    if (this.away === away) return;
+    this.away = away;
+    this.send({ t: 'presence', away });
+  }
+
+  /** Share our copy of the notification directory with the room. */
+  shareDir(entries: PushEntry[]): void {
+    this.send({ t: 'dir', entries });
   }
 
   /** PC: whether phones hear each other while the PC is here. */
@@ -270,6 +356,12 @@ export class RadioLink {
     }
     this.update({ pending: true });
     this.send({ t: 'floor_request' });
+    // No answer at all to a talk press means the socket is likely dead (it can die without
+    // closing): reconnect now instead of waiting for the keep-alive to notice
+    const askedAt = Date.now();
+    setTimeout(() => {
+      if (this.state.pending && this.lastFromServer < askedAt) this.nudge(true);
+    }, FLOOR_ANSWER_MS);
   }
 
   /** `immediate` skips the tail, e.g. when the page is being hidden and timers may not run. */
@@ -309,11 +401,24 @@ export class RadioLink {
     this.ws = ws;
     ws.onopen = () => {
       this.update({ signaling: 'open' });
+      this.lastFromServer = Date.now();
+      if (this.hbTimer) clearInterval(this.hbTimer);
+      // A socket can die silently (network switch, sleeping laptop): notice within HB_DEAD_MS
+      this.hbTimer = setInterval(() => {
+        if (this.ws !== ws) return;
+        if (Date.now() - this.lastFromServer > HB_DEAD_MS) {
+          this.backoff = 1000;
+          ws.close();
+          ws.onclose?.(new CloseEvent('close'));
+          return;
+        }
+        this.send({ t: 'hb' });
+      }, HB_INTERVAL_MS);
       const key = this.opts.accessKey || undefined;
       const v = PROTOCOL_VERSION;
       this.send(
         this.role === 'pc'
-          ? { t: 'host', v, room: this.opts.room, key }
+          ? { t: 'host', v, room: this.opts.room, key, inst: this.inst }
           : {
               t: 'join',
               v,
@@ -322,10 +427,12 @@ export class RadioLink {
               device: this.opts.device,
               name: this.opts.name,
               push: this.opts.pushId,
+              inst: this.inst,
             },
       );
     };
     ws.onmessage = (ev) => {
+      this.lastFromServer = Date.now();
       let msg: ServerMsg;
       try {
         msg = JSON.parse(String(ev.data));
@@ -337,6 +444,8 @@ export class RadioLink {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      if (this.hbTimer) clearInterval(this.hbTimer);
+      this.hbTimer = null;
       // The server releases the floor when our socket drops; mirror that locally.
       this.forceFloor('idle');
       this.update({ signaling: 'closed' });
@@ -377,8 +486,10 @@ export class RadioLink {
         // A floor still held under our id (e.g. after a reconnect) with PTT up would stay stuck
         if (msg.floor === msg.you && !this.txWanted) this.send({ t: 'floor_release' });
         this.opts.onWelcome?.(msg.members);
-        // We have a new member id, so every old connection is dead: start over
-        for (const id of [...this.peers.keys()]) this.teardownPeer(id);
+        // Links to members that are still here (same ids) can keep running; others are stale
+        const here = new Set(msg.members.map((m) => m.id));
+        for (const id of [...this.peers.keys()]) if (!here.has(id)) this.teardownPeer(id);
+        if (this.away) this.send({ t: 'presence', away: true });
         this.reconcile();
         break;
       }
@@ -389,7 +500,14 @@ export class RadioLink {
         this.opts.onRoster?.(msg.members);
         break;
       case 'pinged':
-        this.opts.onPinged?.(msg.sent, msg.gone, msg.limited, msg.unavailable === true);
+        this.opts.onPinged?.({
+          sent: msg.sent,
+          gone: msg.gone,
+          limited: msg.limited,
+          unavailable: msg.unavailable === true,
+          failed: msg.failed ?? 0,
+          waitMs: msg.waitMs ?? 0,
+        });
         break;
       case 'ice':
         this.iceServers = msg.iceServers;
@@ -404,7 +522,12 @@ export class RadioLink {
         // Peers follow the roster (see reconcile)
         break;
       case 'peer_left':
-        this.teardownPeer(msg.id);
+        // The roster that follows handles it (with a grace period for short blips)
+        break;
+      case 'hb':
+        break;
+      case 'dir':
+        this.opts.onDir?.(msg.entries, msg.from);
         break;
       case 'signal':
         await this.onSignal(msg.from, msg.cid, msg.data);
@@ -467,8 +590,28 @@ export class RadioLink {
   private reconcile(): void {
     const self = this.state.selfId;
     if (!self) return;
-    const others = new Set(this.state.members.filter((m) => m.id !== self).map((m) => m.id));
-    for (const id of [...this.peers.keys()]) if (!others.has(id)) this.teardownPeer(id);
+    const members = new Map(this.state.members.filter((m) => m.id !== self).map((m) => [m.id, m]));
+    const others = new Set(members.keys());
+    for (const [id, peer] of [...this.peers]) {
+      const m = members.get(id);
+      if (m && m.inst && peer.inst && m.inst !== peer.inst) {
+        // Same member, new app launch: the old link is dead even if it still looks up
+        this.teardownPeer(id);
+      } else if (m) {
+        // It's back (a blip): keep the link
+        if (peer.goneTimer) clearTimeout(peer.goneTimer);
+        peer.goneTimer = null;
+        peer.inst ??= m.inst;
+        // A link that failed and isn't already being retried: try again
+        if (peer.status === 'failed' && !peer.restartTimer && this.weOffer(id)) void this.startCall(id);
+      } else if (peer.status === 'connected') {
+        // Its socket to the server dropped, but our direct link may be fine: give it a moment
+        peer.goneTimer ??= setTimeout(() => {
+          peer.goneTimer = null;
+          if (this.peers.get(id) === peer && !this.state.members.some((m) => m.id === id)) this.teardownPeer(id);
+        }, GONE_GRACE_MS);
+      } else this.teardownPeer(id);
+    }
     for (const id of others) if (!this.peers.has(id) && this.weOffer(id)) void this.startCall(id);
   }
 
@@ -492,7 +635,12 @@ export class RadioLink {
   private setMembers(members: MemberInfo[]): void {
     const self = this.state.selfId;
     const peerPresent = members.some((m) => m.id !== self);
-    this.update({ members, peerPresent, talker: this.talkerFor(this.state.floor, members) });
+    this.update({
+      members,
+      peerPresent,
+      talker: this.talkerFor(this.state.floor, members),
+      allConnected: this.allLinksUp(members),
+    });
   }
 
   private talkerFor(floor: FloorHolder, members = this.state.members): MemberInfo | null {
@@ -587,10 +735,31 @@ export class RadioLink {
   private newPeer(id: MemberId, cid: string): Peer {
     this.teardownPeer(id);
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const peer: Peer = { id, cid, pc, dc: null, pendingIce: [], status: 'connecting', rttMs: null, route: null, restartTimer: null };
+    const peer: Peer = {
+      id,
+      cid,
+      pc,
+      dc: null,
+      pendingIce: [],
+      status: 'connecting',
+      rttMs: null,
+      route: null,
+      restartTimer: null,
+      disconnectTimer: null,
+      goneTimer: null,
+      watchdog: null,
+      inst: this.state.members.find((m) => m.id === id)?.inst,
+    };
     this.peers.set(id, peer);
     this.syncPeers();
     const live = () => this.peers.get(id) === peer;
+    // Never sit in "connecting" forever (lost offer/answer, no route): start over
+    peer.watchdog = setTimeout(() => {
+      peer.watchdog = null;
+      if (!live() || peer.status === 'connected' || !this.state.members.some((m) => m.id === id)) return;
+      if (this.weOffer(id)) void this.startCall(id);
+      else this.sendSignal(id, peer.cid, { kind: 'restart' });
+    }, CONNECT_WATCHDOG_MS);
 
     pc.onicecandidate = (ev) => {
       if (!live()) return;
@@ -606,21 +775,34 @@ export class RadioLink {
     pc.onconnectionstatechange = () => {
       if (!live()) return;
       const cs = pc.connectionState;
+      // The offering side starts a new call; the answering side asks it to.
+      const restart = (delay: number) => {
+        if (peer.restartTimer) return;
+        peer.restartTimer = setTimeout(() => {
+          peer.restartTimer = null;
+          if (!live() || !this.state.members.some((m) => m.id === id)) return;
+          if (this.weOffer(id)) void this.startCall(id);
+          else this.sendSignal(id, peer.cid, { kind: 'restart' });
+        }, delay);
+      };
+      if (cs !== 'disconnected' && peer.disconnectTimer) {
+        clearTimeout(peer.disconnectTimer);
+        peer.disconnectTimer = null;
+      }
       if (cs === 'connected') peer.status = 'connected';
       else if (cs === 'failed') {
         peer.status = 'failed';
         peer.rttMs = null;
         peer.route = null;
-        // The offering side starts a new call; the answering side asks it to.
-        if (!peer.restartTimer) {
-          peer.restartTimer = setTimeout(() => {
-            peer.restartTimer = null;
-            if (!live() || !this.state.members.some((m) => m.id === id)) return;
-            if (this.weOffer(id)) void this.startCall(id);
-            else this.sendSignal(id, peer.cid, { kind: 'restart' });
-          }, 1500);
-        }
-      } else if (cs === 'disconnected') peer.status = 'connecting';
+        restart(1500);
+      } else if (cs === 'disconnected') {
+        peer.status = 'connecting';
+        // Browsers can sit in 'disconnected' for a long time before 'failed'; don't wait for it
+        peer.disconnectTimer ??= setTimeout(() => {
+          peer.disconnectTimer = null;
+          if (live() && pc.connectionState === 'disconnected') restart(0);
+        }, DISCONNECTED_RESTART_MS);
+      }
       this.syncPeers();
     };
     return peer;
@@ -731,6 +913,9 @@ export class RadioLink {
     if (!peer) return;
     this.peers.delete(id);
     if (peer.restartTimer) clearTimeout(peer.restartTimer);
+    if (peer.disconnectTimer) clearTimeout(peer.disconnectTimer);
+    if (peer.goneTimer) clearTimeout(peer.goneTimer);
+    if (peer.watchdog) clearTimeout(peer.watchdog);
     peer.dc?.close();
     peer.pc.close();
     this.opts.onRemoteStream?.(id, null);
@@ -754,7 +939,16 @@ export class RadioLink {
         return !o || o.id !== p.id || o.status !== p.status || o.rttMs !== p.rttMs || o.route !== p.route;
       });
     if (changed) this.state = { ...this.state, peers };
-    this.update({ peer: best?.status ?? 'none', rttMs: best?.rttMs ?? null, route: best?.route ?? null }, changed);
+    this.update(
+      { peer: best?.status ?? 'none', rttMs: best?.rttMs ?? null, route: best?.route ?? null, allConnected: this.allLinksUp() },
+      changed,
+    );
+  }
+
+  /** Every other member in the room has a connected link from us. */
+  private allLinksUp(members = this.state.members): boolean {
+    const others = members.filter((m) => m.id !== this.state.selfId);
+    return others.length > 0 && others.every((m) => this.peers.get(m.id)?.status === 'connected');
   }
 
   private async pollStats(): Promise<void> {

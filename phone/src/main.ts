@@ -7,9 +7,9 @@ import {
   NOISE_MODES,
   RadioFx,
   RemoteAudio,
+  pingText,
   generateDeviceId,
   isDeviceId,
-  isDirMsg,
   PC_ID,
   PushDirectory,
   CC_SOUND_NAMES,
@@ -126,7 +126,20 @@ const dir = (() => {
 
 function dirChanged(): void {
   store(DIR_KEY, JSON.stringify(dir.toJSON()));
-  link?.sendData({ t: 'dir', entries: dir.toJSON() });
+  link?.shareDir(dir.toJSON());
+}
+
+/** Merge another device's copy of the directory (relayed by the server). */
+function onDir(entries: unknown[]): void {
+  if (!dir.merge(entries)) return;
+  dirChanged();
+  // Someone marked our own entry off (the push service said it's gone): renew it
+  if (dir.get(pushId)?.sub === null) void ownEntryWentOff();
+}
+
+/** Push ids of phones that are here with the app on screen; everyone else gets pinged */
+function activePushIds(): (string | undefined)[] {
+  return (link?.getState().members ?? []).filter((m) => !m.away).map((m) => m.pushId);
 }
 
 /** Our entry was marked off by someone else (the push service said our endpoint is gone). */
@@ -290,7 +303,7 @@ async function connect(): Promise<void> {
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   remotes = new RemoteAudio(fx.ctx);
   void fx.loadSounds(cachedSounds()).then((loaded) => {
-    if (loaded.length) fxStatus.textContent = 'CC sounds ✓';
+    if (loaded.length) fxStatus.textContent = 'CC sounds';
   });
   link = new RadioLink({
     role: 'phone',
@@ -310,40 +323,25 @@ async function connect(): Promise<void> {
         applyPhonesHear();
       } else fx.removeRemote(id);
     },
-    // Every new link shares our copy of the directory (and makes sure our own entry is current)
-    onDataOpen: (id) => {
-      link?.sendData({ t: 'dir', entries: dir.toJSON() }, id);
+    // On every (re)join, share our copy of the directory and make sure our own entry is current
+    onWelcome: () => {
+      link?.shareDir(dir.toJSON());
       void syncOwnEntry();
     },
+    onDir: (entries) => onDir(entries),
     onData: (msg, from) => {
-      if (isDirMsg(msg)) {
-        if (dir.merge(msg.entries)) {
-          dirChanged();
-          // Someone marked our own entry off (the push service said it's gone): renew it
-          if (dir.get(pushId)?.sub === null) void ownEntryWentOff();
-        }
-        return;
-      }
       // Sound files only from the PC (the other phone has no business sending them)
       if (!isFxFileMsg(msg) || !fx || from !== PC_ID) return;
       store(CC_KEY + msg.name, msg.b64);
       const bytes = b64ToBytes(msg.b64);
       void fx.loadSounds({ [msg.name]: bytes.buffer }).then(() => {
-        fxStatus.textContent = 'CC sounds ✓';
+        fxStatus.textContent = 'CC sounds';
       });
     },
-    pingTargets: () => dir.absent(link?.getState().members.map((m) => m.pushId) ?? []),
-    onPinged: (sent, gone, limited, unavailable) => {
-      if (gone.length && dir.dropEndpoints(gone)) dirChanged();
-      showPingMsg(
-        unavailable
-          ? 'Pinging isn’t set up on the server'
-          : limited
-            ? 'Pinged recently, try again in 30 s'
-            : sent
-              ? `Pinged ${sent} phone${sent > 1 ? 's' : ''}`
-              : 'Nobody to ping',
-      );
+    pingTargets: () => dir.absent(activePushIds()),
+    onPinged: (r) => {
+      if (r.gone.length && dir.dropEndpoints(r.gone)) dirChanged();
+      showPingMsg(pingText(r));
     },
   });
   link.setMicTrack(tx?.track ?? sentClone);
@@ -354,11 +352,8 @@ async function connect(): Promise<void> {
   initPush(publishOwnSub, $<HTMLButtonElement>('notify'));
   // The "still alone?" hint depends on time, not on link changes
   setInterval(() => link && render(link.getState()), 30_000);
-  const pingBtn = $<HTMLButtonElement>('ping');
-  pingBtn.addEventListener('click', () => {
-    if (link?.ping()) fx?.playPingSent();
-    else showPingMsg('Not connected to the server');
-  });
+  // Back online or back on screen: reconnect now rather than after the backoff
+  window.addEventListener('online', () => link?.nudge());
   void requestWakeLock();
   requestAnimationFrame(meterLoop);
 }
@@ -510,10 +505,13 @@ function bindPtt(): void {
   });
   document.addEventListener('visibilitychange', () => {
     // Timers may not run once hidden, so end TX without the tail
+    // Away (backgrounded or locked) counts as gone for pings, so the other phone can call us back
+    link?.setAway(document.hidden);
     if (document.hidden) releaseAll(true);
     else {
       fx?.unlock();
       void requestWakeLock();
+      link?.nudge();
     }
   });
   window.addEventListener('blur', () => releaseAll());
@@ -554,12 +552,10 @@ function render(s: LinkState): void {
     store(DIR_KEY, null);
   }
   const me = s.members.find((m) => m.id === s.selfId);
-  const otherPhones = s.members.filter((m) => m.role === 'phone' && m.id !== s.selfId);
   const pcHere = s.members.some((m) => m.role === 'pc');
   applyPhonesHear();
   // Remember the name the PC gave us for when it's off
   if (me && (me.name ?? null) !== load(NAME_KEY)) store(NAME_KEY, me.name ?? null);
-  $('ping').hidden = s.signaling !== 'open' || !s.selfId;
   const alone = s.signaling === 'open' && !!s.selfId && !s.peerPresent;
   if (!alone) aloneSince = 0;
   else if (!aloneSince) aloneSince = Date.now();
@@ -568,7 +564,8 @@ function render(s: LinkState): void {
   else if (s.error && s.signaling === 'closed') setTile('link', 'OFF', 'red');
   else if (s.signaling !== 'open') setTile('link', 'SERVER…', 'amber');
   else if (!s.peerPresent) setTile('link', 'ALONE', 'amber');
-  else if (s.peer === 'connected') setTile('link', pcHere ? 'CONNECTED' : 'PHONE ↔ PHONE', 'green');
+  else if (s.peer === 'connected' && !s.allConnected) setTile('link', 'PARTIAL', 'amber');
+  else if (s.peer === 'connected') setTile('link', pcHere ? 'CONNECTED' : 'PC OFF', 'green');
   else if (s.peer === 'failed') setTile('link', 'FAILED', 'red');
   else setTile('link', 'LINKING', 'amber');
 
@@ -579,25 +576,22 @@ function render(s: LinkState): void {
   // PTT tile
   const fatal = !!s.error && !roomFull && s.signaling === 'closed';
   $('repair').hidden = !fatal;
-  if (roomFull) {
-    // Keeps retrying in the background and joins when a seat frees up
-    setPtt('ROOM FULL', 'Two phones are already connected. Waiting for a free seat', 'flag-amber');
-  } else if (fatal) {
+  // Keep the talk tile to one word and, at most, a name
+  if (roomFull) setPtt('ROOM FULL', '', 'flag-amber'); // keeps retrying; joins when a seat frees up
+  else if (fatal) {
     setPtt('OFFLINE', s.error!, 'flag-red');
-    footMsg.textContent = 'Reload the page to reconnect';
-  } else if (s.tx) setPtt('TX', 'Transmitting', 'flag-red pulse');
-  else if (s.rx) setPtt('RX', `${nameOf(s.talker)} talking`, 'flag-blue pulse');
-  else if (s.pending) setPtt('…', 'Keying up', 'flag-amber');
-  else if (s.peer === 'connected') {
-    const withWho = otherPhones.length ? ` · with ${otherPhones.map(nameOf).join(', ')}` : '';
-    setPtt('HOLD TO TALK', `You: ${nameOf(me)}${withWho}${pcHere ? '' : ' (PC off)'}`, 'idle');
-  } else if (alone) setPtt('WAITING', 'Nobody else is on. Tap Ping (or triple-tap) to call them', 'disabled');
-  else setPtt('LINKING', 'Connecting…', 'disabled');
+    footMsg.textContent = 'Reload to reconnect';
+  } else if (s.tx) setPtt('TX', nameOf(me), 'flag-red pulse');
+  else if (s.rx) setPtt('RX', nameOf(s.talker), 'flag-blue pulse');
+  else if (s.pending) setPtt('TX', '', 'flag-amber');
+  else if (s.peer === 'connected' && s.signaling === 'open') setPtt('TALK', nameOf(me), 'idle');
+  else if (alone) setPtt('ALONE', '', 'disabled');
+  else setPtt('LINKING', '', 'disabled');
 
   if (!fatal) {
     // Alone for a long time can mean the PC made a new code and this phone has an old one
     const stale = alone && Date.now() - aloneSince > 120_000;
-    footMsg.textContent = stale ? 'Still alone? Ping the others. If the PC made a New code, pair again' : '';
+    footMsg.textContent = stale ? 'Triple-tap to ping' : '';
     if (stale) $('repair').hidden = false;
   }
 }

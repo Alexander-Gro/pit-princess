@@ -29,7 +29,10 @@ const ice = createIceProvider();
 const ACCESS_KEY = process.env.ACCESS_KEY ?? '';
 // publicUrl() is a hoisted function declaration, so it's safe to call here
 const push = createPusher(process.env, publicUrl());
-const hub = new RoomHub({ getIceServers: ice.get, accessKey: ACCESS_KEY, push: push.pusher });
+// Phones' member ids are derived from this, so keeping it stable lets links survive a restart.
+// Falls back to the access key (stable on Render), else random per process.
+const ID_SECRET = process.env.ID_SECRET || (ACCESS_KEY ? `ids:${ACCESS_KEY}` : '');
+const hub = new RoomHub({ getIceServers: ice.get, accessKey: ACCESS_KEY, idSecret: ID_SECRET, push: push.pusher });
 
 function lanAddress(): string | null {
   for (const list of Object.values(networkInterfaces())) {

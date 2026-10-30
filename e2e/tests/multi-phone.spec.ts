@@ -28,10 +28,10 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     // ---- both connect ----
     const a = await openPhone(browser, 'phoneA', room);
     phones.push(a);
-    await expect(a.text).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+    await expect(a.text).toHaveText('TALK', { timeout: 20_000 });
     const b = await openPhone(browser, 'phoneB', room);
     phones.push(b);
-    await expect(b.text).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+    await expect(b.text).toHaveText('TALK', { timeout: 20_000 });
     await expect
       .poll(async () => (await pcState(pc)).peers.filter((p) => p.status === 'connected').length, { timeout: 20_000 })
       .toBe(2);
@@ -55,9 +55,9 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     // Every phone has a push id in the roster
     expect(memA.pushId).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
     expect(memB.pushId).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
-    // Unnamed phones read "Phone 1/2"
-    await expect(a.sub).toHaveText('You: Phone 1 · with Phone 2');
-    await expect(b.sub).toHaveText('You: Phone 2 · with Phone 1');
+    // Unnamed phones read "Phone 1/2" (v4: the talk tile shows only our own name)
+    await expect(a.sub).toHaveText('Phone 1');
+    await expect(b.sub).toHaveText('Phone 2');
     // Phones never see device ids
     for (const p of [a, b]) {
       const all = p.frames.join('\n');
@@ -67,8 +67,8 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
 
     // ---- names set by the PC show on the phones ----
     await pc.evaluate((n) => window.pit.setNames(n), { pc: 'Pit wall', [memA.id]: 'Emma', [memB.id]: 'Lou' });
-    await expect(a.sub).toHaveText('You: Emma · with Lou');
-    await expect(b.sub).toHaveText('You: Lou · with Emma');
+    await expect(a.sub).toHaveText('Emma');
+    await expect(b.sub).toHaveText('Lou');
 
     // ---- phone A keys up: PC rx, B shows RX with the talker's name, and A's audio reaches B ----
     await pc.waitForTimeout(500);
@@ -78,7 +78,8 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     await expect.poll(async () => (await pcState(pc)).rx).toBe(true);
     expect((await pcState(pc)).floor).toBe(memA.id);
     await expect(b.text).toHaveText('RX');
-    await expect(b.sub).toHaveText('Emma talking');
+    await expect(b.sub).toHaveText('Emma');
+    await expect(a.sub).toHaveText('Emma');
     await pc.waitForTimeout(300);
     const txB = await phoneRate(b);
     const pcFromA0 = await pc.evaluate((id) => window.pit.rxBytes(id), memA.id);
@@ -99,8 +100,8 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     // A releases: idle everywhere
     await release(a);
     await expect.poll(async () => (await pcState(pc)).floor).toBe('idle');
-    await expect(a.text).toHaveText('HOLD TO TALK');
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(a.text).toHaveText('TALK');
+    await expect(b.text).toHaveText('TALK');
 
     // ---- the PC's "phones hear each other" setting reaches both phones in the roster ----
     await pc.evaluate(() => window.pit.setPhonesHear(false));
@@ -117,7 +118,7 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     await expect.poll(async () => (await pcState(pc)).tx).toBe(true);
     for (const p of [a, b]) {
       await expect(p.text).toHaveText('RX');
-      await expect(p.sub).toHaveText('Pit wall talking');
+      await expect(p.sub).toHaveText('Pit wall');
     }
     await pc.waitForTimeout(300);
     const txRates = await Promise.all([phoneRate(a), phoneRate(b)]);
@@ -125,7 +126,7 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     expect(txRates[0]).toBeGreaterThan(idleRates[0] * 1.2);
     expect(txRates[1]).toBeGreaterThan(idleRates[1] * 1.2);
     await pc.evaluate(() => window.pit.up());
-    for (const p of [a, b]) await expect(p.text).toHaveText('HOLD TO TALK');
+    for (const p of [a, b]) await expect(p.text).toHaveText('TALK');
 
     // ---- a third phone: ROOM FULL ----
     const c = await openPhone(browser, 'phoneC', room);
@@ -134,8 +135,8 @@ test('two phones and the PC: full mesh, names, audio between phones, busy, room 
     expect(c.frames.some((f) => f.includes('"code":"room_full"'))).toBe(true);
     // ...and the two phones in the room are undisturbed
     expect((await pcState(pc)).members.filter((m) => m.role === 'phone')).toHaveLength(2);
-    await expect(a.text).toHaveText('HOLD TO TALK');
-    await expect(b.text).toHaveText('HOLD TO TALK');
+    await expect(a.text).toHaveText('TALK');
+    await expect(b.text).toHaveText('TALK');
   } finally {
     for (const p of phones) await p.context.close();
   }
@@ -150,7 +151,7 @@ test('a third phone gets in once the PC kicks one (it keeps retrying)', async ({
     for (const n of ['phoneA', 'phoneB']) {
       const p = await openPhone(browser, n, room);
       phones.push(p);
-      await expect(p.text).toHaveText('HOLD TO TALK', { timeout: 20_000 });
+      await expect(p.text).toHaveText('TALK', { timeout: 20_000 });
     }
     const c = await openPhone(browser, 'phoneC', room);
     phones.push(c);
@@ -160,9 +161,9 @@ test('a third phone gets in once the PC kicks one (it keeps retrying)', async ({
     await pc.evaluate((id) => window.pit.kick(id), idA);
     await expect(phones[0].text).toHaveText('OFFLINE');
     // C retries with backoff and takes the free seat (slot 1)
-    await expect(c.text).toHaveText('HOLD TO TALK', { timeout: 30_000 });
-    await expect(c.sub).toHaveText('You: Phone 1 · with Phone 2');
-    await expect(phones[1].sub).toHaveText('You: Phone 2 · with Phone 1');
+    await expect(c.text).toHaveText('TALK', { timeout: 30_000 });
+    await expect(c.sub).toHaveText('Phone 1');
+    await expect(phones[1].sub).toHaveText('Phone 2');
     // ...and C links to B directly too
     await expect.poll(() => connectedPcs(c), { timeout: 20_000 }).toBe(2);
   } finally {

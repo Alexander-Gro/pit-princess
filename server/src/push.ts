@@ -11,13 +11,18 @@ export function createPusher(env: NodeJS.ProcessEnv, fallbackSubject: string): {
   const publicKey = env.VAPID_PUBLIC_KEY?.trim();
   const privateKey = env.VAPID_PRIVATE_KEY?.trim();
   if (!publicKey || !privateKey) return { pusher: null, publicKey: null };
-  const subject = env.VAPID_SUBJECT?.trim() || (fallbackSubject.startsWith('https://') ? fallbackSubject : 'mailto:pit-princess@example.invalid');
-  webpush.setVapidDetails(subject, publicKey, privateKey);
+  const subject = env.VAPID_SUBJECT?.trim() || (fallbackSubject.startsWith('https://') ? fallbackSubject : '');
+  if (!subject) {
+    // Apple rejects pushes without a real contact (https URL or mailto)
+    console.warn('[push] set VAPID_SUBJECT (mailto:you@example.com) or PUBLIC_URL (https); iPhones will refuse alerts');
+  }
+  webpush.setVapidDetails(subject || 'mailto:pit-princess@localhost', publicKey, privateKey);
 
   const pusher: Pusher = {
     async send(subs: PushSub[], payload: object) {
       const body = JSON.stringify(payload);
       let sent = 0;
+      let failed = 0;
       const gone: string[] = [];
       await Promise.all(
         subs.map(async (sub) => {
@@ -28,11 +33,14 @@ export function createPusher(env: NodeJS.ProcessEnv, fallbackSubject: string): {
           } catch (e) {
             const status = (e as { statusCode?: number }).statusCode;
             if (status === 404 || status === 410) gone.push(sub.endpoint);
-            else console.warn('[push] send failed', status ?? (e instanceof Error ? e.message : e));
+            else {
+              failed++;
+              console.warn('[push] send failed', status ?? (e instanceof Error ? e.message : e));
+            }
           }
         }),
       );
-      return { sent, gone };
+      return { sent, gone, failed };
     },
   };
   return { pusher, publicKey };
