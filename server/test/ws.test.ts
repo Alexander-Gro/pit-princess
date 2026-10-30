@@ -83,6 +83,20 @@ class Client {
 }
 
 const settle = () => new Promise((r) => setTimeout(r, 150));
+const DEV_A = 'devAAAAAAAAAAAAAAAAAAA';
+const DEV_B = 'devBBBBBBBBBBBBBBBBBBB';
+const DEV_C = 'devCCCCCCCCCCCCCCCCCCC';
+
+/** Wait until a message matching pred has arrived (buffered or new); it is left in the buffer. */
+async function waitFor(c: Client, pred: (m: ServerMsg) => boolean, timeoutMs = 3000): Promise<ServerMsg> {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const m = c.msgs.find(pred);
+    if (m) return m;
+    if (Date.now() > until) throw new Error(`timeout; got ${JSON.stringify(c.msgs)}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
 
 beforeAll(async () => {
   port = await freePort();
@@ -121,77 +135,132 @@ describe('real server over WebSocket', () => {
     const phone = new Client();
     await Promise.all([pc.open(), phone.open()]);
 
-    pc.send({ t: 'host', room: ROOM });
+    pc.send({ t: 'host', v: 2, room: ROOM });
     const w1 = await pc.next('welcome');
-    expect(w1).toMatchObject({ role: 'pc', peerPresent: false, floor: 'idle' });
+    expect(w1).toMatchObject({ role: 'pc', you: 'pc', floor: 'idle', members: [{ id: 'pc', role: 'pc', name: null }] });
     expect(Array.isArray(w1.iceServers) && w1.iceServers.length).toBeTruthy();
 
-    phone.send({ t: 'join', room: ROOM });
-    expect(await phone.next('welcome')).toMatchObject({ role: 'phone', peerPresent: true, floor: 'idle' });
-    await pc.next('peer_joined');
+    phone.send({ t: 'join', v: 2, room: ROOM, device: DEV_A });
+    const w2 = await phone.next('welcome');
+    expect(w2).toMatchObject({ role: 'phone', floor: 'idle' });
+    const id = w2.you;
+    expect(id).toMatch(/^m[A-Za-z0-9_-]{12}$/);
+    expect(w2.members).toEqual([
+      { id: 'pc', role: 'pc', name: null },
+      { id, role: 'phone', name: null, slot: 1 },
+    ]);
+    expect(await pc.next('peer_joined')).toEqual({ t: 'peer_joined', id });
+    await waitFor(pc, (m) => m.t === 'roster' && m.members.some((x) => x.id === id && x.device === DEV_A));
 
-    // signaling relay
-    pc.send({ t: 'signal', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
-    expect(await phone.next('signal')).toEqual({ t: 'signal', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
-    phone.send({ t: 'signal', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
-    expect(await pc.next('signal')).toEqual({ t: 'signal', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
-    phone.send({ t: 'signal', data: { kind: 'ice', candidate: null } });
-    expect(await pc.next('signal')).toEqual({ t: 'signal', data: { kind: 'ice', candidate: null } });
+    // signaling relay, with cid passed through and from set by the server (a spoofed from is ignored)
+    pc.send({ t: 'signal', to: id, cid: 'cid-0001', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
+    expect(await phone.next('signal')).toEqual({ t: 'signal', from: 'pc', cid: 'cid-0001', data: { kind: 'offer', sdp: 'v=0 fake-offer' } });
+    phone.send({ t: 'signal', from: 'pc', cid: 'cid-0001', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
+    expect(await pc.next('signal')).toEqual({ t: 'signal', from: id, cid: 'cid-0001', data: { kind: 'answer', sdp: 'v=0 fake-answer' } });
+    phone.send({ t: 'signal', cid: 'cid-0001', data: { kind: 'ice', candidate: null } });
+    expect(await pc.next('signal')).toEqual({ t: 'signal', from: id, cid: 'cid-0001', data: { kind: 'ice', candidate: null } });
 
     // floor
     phone.send({ t: 'floor_request' });
-    expect(await phone.next('floor')).toEqual({ t: 'floor', holder: 'phone' });
-    expect(await pc.next('floor')).toEqual({ t: 'floor', holder: 'phone' });
+    expect(await phone.next('floor')).toEqual({ t: 'floor', holder: id });
+    expect(await pc.next('floor')).toEqual({ t: 'floor', holder: id });
     pc.send({ t: 'floor_request' });
     await pc.next('busy');
     pc.send({ t: 'floor_release' }); // ignored: pc is not the holder
     phone.send({ t: 'floor_release' });
     expect(await pc.next('floor')).toEqual({ t: 'floor', holder: 'idle' });
     expect(await phone.next('floor')).toEqual({ t: 'floor', holder: 'idle' });
-    expect(pc.msgs).toEqual([]); // nothing from the ignored release
+    expect(pc.msgs.filter((m) => m.t === 'floor')).toEqual([]); // nothing from the ignored release
+
+    // names
+    pc.send({ t: 'names', names: { pc: 'Pit wall', [id]: 'Emma' } });
+    await waitFor(phone, (m) => m.t === 'roster' && m.members.some((x) => x.id === id && x.name === 'Emma'));
 
     // PC takes the floor (it is released later when the PC socket drops)
     pc.send({ t: 'floor_request' });
     await pc.next('floor');
     await phone.next('floor');
     // kick: phone gets kicked and its socket is closed by the server
-    pc.send({ t: 'kick' });
+    pc.send({ t: 'kick', id });
     expect(await phone.next('kicked')).toEqual({ t: 'kicked', reason: 'kicked' });
     await phone.closed;
-    await pc.next('peer_left');
+    expect(await pc.next('peer_left')).toEqual({ t: 'peer_left', id });
 
     // a new phone rejoins; PC still holds the floor
     const phone2 = new Client();
     await phone2.open();
-    phone2.send({ t: 'join', room: ROOM });
-    expect(await phone2.next('welcome')).toMatchObject({ peerPresent: true, floor: 'pc' });
+    phone2.send({ t: 'join', v: 2, room: ROOM, device: DEV_B });
+    expect(await phone2.next('welcome')).toMatchObject({ floor: 'pc' });
     await pc.next('peer_joined');
     pc.close();
     expect(await phone2.next('floor')).toEqual({ t: 'floor', holder: 'idle' });
-    await phone2.next('peer_left');
+    expect(await phone2.next('peer_left')).toEqual({ t: 'peer_left', id: 'pc' });
     phone2.close();
   });
 
-  it('second phone replaces the first over real sockets', async () => {
+  it('same-device rejoin replaces the old socket: floor released, PC sees peer_left(old) then peer_joined(new)', async () => {
     const room = 'wsReplaceRoom_0123456789';
     const pc = new Client();
     const a = new Client();
     const b = new Client();
     await Promise.all([pc.open(), a.open(), b.open()]);
-    pc.send({ t: 'host', room });
+    pc.send({ t: 'host', v: 2, room });
     await pc.next('welcome');
-    a.send({ t: 'join', room });
-    await a.next('welcome');
+    a.send({ t: 'join', v: 2, room, device: DEV_A });
+    const oldId = (await a.next('welcome')).you;
     await pc.next('peer_joined');
-    b.send({ t: 'join', room });
-    await b.next('welcome');
+    a.send({ t: 'floor_request' });
+    await pc.next('floor');
+    b.send({ t: 'join', v: 2, room, device: DEV_A });
+    const newId = (await b.next('welcome')).you;
+    expect(newId).not.toBe(oldId);
     expect(await a.next('kicked')).toEqual({ t: 'kicked', reason: 'replaced' });
     await a.closed;
-    await pc.next('peer_joined');
-    await settle();
-    expect(pc.msgs.filter((m) => m.t === 'peer_left')).toEqual([]);
+    expect(await pc.next('floor')).toEqual({ t: 'floor', holder: 'idle' });
+    expect(await pc.next('peer_left')).toEqual({ t: 'peer_left', id: oldId });
+    expect(await pc.next('peer_joined')).toEqual({ t: 'peer_joined', id: newId });
     pc.close();
     b.close();
+  });
+
+  it('two phones fit, a third gets room_full over a socket that stays open, and gets in when a seat frees', async () => {
+    const room = 'wsFullRoom_0123456789';
+    const pc = new Client();
+    const a = new Client();
+    const b = new Client();
+    const c = new Client();
+    await Promise.all([pc.open(), a.open(), b.open(), c.open()]);
+    pc.send({ t: 'host', v: 2, room });
+    await pc.next('welcome');
+    a.send({ t: 'join', v: 2, room, device: DEV_A });
+    const aId = (await a.next('welcome')).you;
+    b.send({ t: 'join', v: 2, room, device: DEV_B });
+    const bw = await b.next('welcome');
+    expect(bw.members.map((m) => m.slot ?? 0)).toEqual([0, 1, 2]);
+    c.send({ t: 'join', v: 2, room, device: DEV_C });
+    expect(await c.next('error')).toEqual({ t: 'error', code: 'room_full' });
+    await settle();
+    expect(c.ws.readyState).toBe(WebSocket.OPEN);
+    // Phones never see device ids
+    expect(JSON.stringify([...a.msgs, ...b.msgs, bw])).not.toMatch(/devA|devB|devC/);
+    // A phone's signal reaches the PC tagged with its id, even when it names the other phone as `to`
+    a.send({ t: 'signal', to: bw.you, cid: 'cid-0002', data: { kind: 'answer', sdp: 'x' } });
+    expect(await pc.next('signal')).toMatchObject({ from: aId, cid: 'cid-0002' });
+    pc.send({ t: 'kick', id: aId });
+    await a.closed;
+    c.send({ t: 'join', v: 2, room, device: DEV_C });
+    const cw = await c.next('welcome');
+    expect(cw.members.find((m) => m.id === cw.you)?.slot).toBe(1);
+    expect(b.msgs.filter((m) => m.t === 'signal')).toEqual([]);
+    for (const x of [pc, b, c]) x.close();
+  });
+
+  it('host/join without v: update_required, then the server closes the socket', async () => {
+    const old = new Client();
+    await old.open();
+    old.send({ t: 'join', room: ROOM, device: DEV_A });
+    expect(await old.next('error')).toEqual({ t: 'error', code: 'update_required' });
+    await old.closed;
   });
 
   it('rejects bad input', async () => {
@@ -199,7 +268,7 @@ describe('real server over WebSocket', () => {
     await c.open();
     c.send('not json');
     expect(await c.next('error')).toEqual({ t: 'error', code: 'bad_message' });
-    c.send({ t: 'join', room: 'short' });
+    c.send({ t: 'join', v: 2, room: 'short' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'bad_room' });
     c.send({ t: 'floor_request' });
     expect(await c.next('error')).toEqual({ t: 'error', code: 'not_in_room' });

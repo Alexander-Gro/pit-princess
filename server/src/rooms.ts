@@ -1,7 +1,28 @@
 // Room + floor logic, independent of the transport so it can be tested directly.
 
-import { timingSafeEqual, createHash, randomInt } from 'node:crypto';
-import { MAX_PUSH_SUBS, MAX_TX_MS, PAIR_CODE_RE, PAIR_CODE_TTL_MS, isPushSub, type PushSub, ROOM_CODE_RE, type ClientMsg, type FloorHolder, type Role, type ServerMsg } from '@pit/shared';
+import { timingSafeEqual, createHash, randomInt, randomBytes } from 'node:crypto';
+import {
+  MAX_PHONES,
+  MAX_PUSH_SUBS,
+  MAX_TX_MS,
+  PAIR_CODE_RE,
+  PAIR_CODE_TTL_MS,
+  CALL_ID_RE,
+  MEMBER_ID_RE,
+  PC_ID,
+  PROTOCOL_VERSION,
+  ROOM_CODE_RE,
+  cleanName,
+  isDeviceId,
+  isPushSub,
+  type ClientMsg,
+  type FloorHolder,
+  type MemberId,
+  type MemberInfo,
+  type PushSub,
+  type Role,
+  type ServerMsg,
+} from '@pit/shared';
 
 export interface Conn {
   send(msg: ServerMsg): void;
@@ -11,13 +32,22 @@ export interface Conn {
 interface Member {
   conn: Conn;
   role: Role;
+  /** 'pc', or a random id for this phone connection (phones never learn each other's device id) */
+  id: MemberId;
+  /** Phones: the device id they joined with; the PC uses it to remember names */
+  device: string | null;
+  /** Phones: seat number 1..MAX_PHONES, kept while connected */
+  slot: number;
   room: Room;
 }
 
 interface Room {
   code: string;
   pc: Conn | null;
-  phone: Conn | null;
+  /** member id -> connection, at most MAX_PHONES */
+  phones: Map<MemberId, Conn>;
+  /** Display names set by the PC, by member id (dropped when the member leaves) */
+  names: Record<MemberId, string>;
   floor: FloorHolder;
   floorTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -48,13 +78,11 @@ const ANNOUNCES_PER_CONN = 3;
 const ANNOUNCES_PER_WINDOW = 30;
 const ANNOUNCE_WINDOW_MS = 60_000;
 
-const other = (r: Role): Role => (r === 'pc' ? 'phone' : 'pc');
-
 export class RoomHub {
   readonly rooms = new Map<string, Room>();
   private members = new Map<Conn, Member>();
   /** Connections currently waiting on ICE servers before entering a room */
-  private entering = new Map<Conn, { role: Role; code: string }>();
+  private entering = new Map<Conn, { role: Role; code: string; device: string | null }>();
   private opts: Required<HubOptions>;
   /** pairing code -> room code */
   private pairCodes = new Map<string, { room: string; expires: number }>();
@@ -80,12 +108,19 @@ export class RoomHub {
       return;
     }
     if (msg.t === 'host' || msg.t === 'join') {
+      if (msg.v !== PROTOCOL_VERSION) {
+        // An app from before multi-phone rooms; it would half-work, so ask for a reload instead
+        conn.send({ t: 'error', code: 'update_required' });
+        conn.close();
+        return;
+      }
       if (!this.keyOk(msg.key)) {
         conn.send({ t: 'error', code: 'unauthorized' });
         conn.close();
         return;
       }
-      await this.enter(conn, msg.t === 'host' ? 'pc' : 'phone', msg.room);
+      const device = msg.t === 'join' && isDeviceId(msg.device) ? msg.device : null;
+      await this.enter(conn, msg.t === 'host' ? 'pc' : 'phone', msg.room, device);
       return;
     }
     const m = this.members.get(conn);
@@ -96,21 +131,30 @@ export class RoomHub {
     const room = m.room;
     switch (msg.t) {
       case 'signal': {
-        this.connOf(room, other(m.role))?.send({ t: 'signal', data: msg.data });
+        // Phones only ever talk to the PC; the PC says which phone
+        const target = m.role === 'phone' ? room.pc : msg.to ? room.phones.get(msg.to) : undefined;
+        target?.send({ t: 'signal', from: m.id, cid: msg.cid, data: msg.data });
         break;
       }
       case 'floor_request': {
-        if (room.floor === m.role) {
-          conn.send({ t: 'floor', holder: m.role });
-        } else if (room.floor !== 'idle' || !this.connOf(room, other(m.role))) {
+        if (room.floor === m.id) {
+          conn.send({ t: 'floor', holder: m.id });
+        } else if (room.floor !== 'idle' || (m.role === 'phone' ? !room.pc : room.phones.size === 0)) {
           conn.send({ t: 'busy' });
         } else {
-          this.setFloor(room, m.role);
+          this.setFloor(room, m.id);
         }
         break;
       }
       case 'floor_release': {
-        if (room.floor === m.role) this.setFloor(room, 'idle');
+        if (room.floor === m.id) this.setFloor(room, 'idle');
+        break;
+      }
+      case 'names': {
+        if (m.role !== 'pc') break;
+        const present = new Set([PC_ID, ...room.phones.keys()]);
+        room.names = Object.fromEntries(Object.entries(msg.names).filter(([id]) => present.has(id)));
+        this.broadcastRoster(room);
         break;
       }
       case 'announce': {
@@ -130,10 +174,13 @@ export class RoomHub {
         break;
       }
       case 'kick': {
-        if (m.role !== 'pc' || !room.phone) break;
-        const phone = room.phone;
-        this.removeMember(phone, { t: 'kicked', reason: 'kicked' });
-        phone.close();
+        if (m.role !== 'pc') break;
+        const one = msg.id ? room.phones.get(msg.id) : undefined;
+        const targets = msg.id ? (one ? [one] : []) : [...room.phones.values()];
+        for (const phone of targets) {
+          this.removeMember(phone, { t: 'kicked', reason: 'kicked' });
+          phone.close();
+        }
         break;
       }
     }
@@ -155,7 +202,13 @@ export class RoomHub {
     }
     for (const [c, p] of this.pairCodes) if (p.expires <= now) this.pairCodes.delete(c);
     const entry = PAIR_CODE_RE.test(code) ? this.pairCodes.get(code) : undefined;
-    if (!entry || !this.rooms.get(entry.room)?.pc) {
+    const target = entry ? this.rooms.get(entry.room) : undefined;
+    if (entry && target?.pc && target.phones.size >= MAX_PHONES) {
+      // Valid code, no free seat: keep the code for after a phone is kicked
+      conn.send({ t: 'error', code: 'room_full' });
+      return;
+    }
+    if (!entry || !target?.pc) {
       this.pairTries.set(conn, tries + 1);
       this.pairFails.push(now);
       conn.send({ t: 'error', code: 'bad_code' });
@@ -175,7 +228,6 @@ export class RoomHub {
     const perConn = this.announcesPerConn.get(conn) ?? 0;
     if (
       !this.opts.push ||
-      room.phone ||
       subs.length === 0 ||
       now - last < this.opts.announceCooldownMs ||
       perConn >= ANNOUNCES_PER_CONN ||
@@ -225,14 +277,14 @@ export class RoomHub {
     this.removeMember(conn, null);
   }
 
-  private async enter(conn: Conn, role: Role, code: string): Promise<void> {
+  private async enter(conn: Conn, role: Role, code: string, device: string | null): Promise<void> {
     if (!ROOM_CODE_RE.test(code)) {
       conn.send({ t: 'error', code: 'bad_room' });
       return;
     }
     // A second host/join while the first waits for ICE just updates the target; the latest wins.
     const waiting = this.entering.has(conn);
-    this.entering.set(conn, { role, code });
+    this.entering.set(conn, { role, code, device });
     if (waiting) return;
     let iceServers: RTCIceServer[];
     try {
@@ -243,21 +295,22 @@ export class RoomHub {
     const target = this.entering.get(conn);
     if (!target) return; // disconnected while waiting
     this.entering.delete(conn);
-    ({ role, code } = target);
+    ({ role, code, device } = target);
 
     const prev = this.members.get(conn);
     if (prev) {
-      if (prev.room.code === code && prev.role === role) {
-        conn.send(this.welcome(prev.room, role, iceServers));
+      if (prev.room.code === code && prev.role === role && prev.device === device) {
+        conn.send(this.welcome(prev.room, prev, iceServers));
         return;
       }
-      // A host switching to a new code closes its old room (and kicks the phone in it).
+      // A host switching to a new code closes its old room (and kicks the phones in it).
       const oldRoom = prev.room;
       this.removeMember(conn, null);
-      if (role === 'pc' && oldRoom.phone) {
-        const phone = oldRoom.phone;
-        this.removeMember(phone, { t: 'kicked', reason: 'room_closed' });
-        phone.close();
+      if (prev.role === 'pc') {
+        for (const phone of [...oldRoom.phones.values()]) {
+          this.removeMember(phone, { t: 'kicked', reason: 'room_closed' });
+          phone.close();
+        }
       }
     }
 
@@ -272,31 +325,80 @@ export class RoomHub {
         conn.send({ t: 'error', code: 'bad_room' });
         return;
       }
-      room = { code, pc: null, phone: null, floor: 'idle', floorTimer: null };
+      room = { code, pc: null, phones: new Map(), names: {}, floor: 'idle', floorTimer: null };
       this.rooms.set(code, room);
     }
 
-    const existing = this.connOf(room, role);
+    // Same PC or same phone device reconnecting: the new connection takes over. The old one is
+    // removed normally (floor released, PC told peer_left) and the new one gets a fresh member id.
+    const existing =
+      role === 'pc'
+        ? room.pc
+        : device
+          ? [...room.phones.values()].find((c) => this.members.get(c)?.device === device)
+          : undefined;
+    let slot = 0;
     if (existing && existing !== conn) {
+      slot = this.members.get(existing)?.slot ?? 0;
       this.removeMember(existing, { t: 'kicked', reason: 'replaced' }, true);
       existing.close();
+    } else if (role === 'phone' && room.phones.size >= MAX_PHONES) {
+      conn.send({ t: 'error', code: 'room_full' });
+      return;
     }
 
+    const id = role === 'pc' ? PC_ID : this.newMemberId();
+    if (role === 'phone' && !slot) {
+      const used = new Set([...room.phones.values()].map((c) => this.members.get(c)?.slot));
+      slot = 1;
+      while (used.has(slot)) slot++;
+    }
     if (role === 'pc') room.pc = conn;
-    else room.phone = conn;
-    this.members.set(conn, { conn, role, room });
+    else room.phones.set(id, conn);
+    const member: Member = { conn, role, id, device: role === 'phone' ? device : null, slot, room };
+    this.members.set(conn, member);
 
-    conn.send(this.welcome(room, role, iceServers));
-    this.connOf(room, other(role))?.send({ t: 'peer_joined' });
+    conn.send(this.welcome(room, member, iceServers));
+    // WebRTC runs PC <-> each phone, so only those pairs hear about each other's arrival
+    if (role === 'pc') for (const phone of room.phones.values()) phone.send({ t: 'peer_joined', id: PC_ID });
+    else room.pc?.send({ t: 'peer_joined', id });
+    this.broadcastRoster(room);
   }
 
-  private welcome(room: Room, role: Role, iceServers: RTCIceServer[]): ServerMsg {
-    return { t: 'welcome', role, iceServers, peerPresent: !!this.connOf(room, other(role)), floor: room.floor };
+  private welcome(room: Room, m: Member, iceServers: RTCIceServer[]): ServerMsg {
+    return { t: 'welcome', role: m.role, you: m.id, iceServers, floor: room.floor, members: this.roster(room, m.role === 'pc') };
+  }
+
+  /** `forPc` adds phones' device ids, which only the PC needs (to remember names) */
+  private roster(room: Room, forPc: boolean): MemberInfo[] {
+    const list: MemberInfo[] = [];
+    if (room.pc) list.push({ id: PC_ID, role: 'pc', name: room.names[PC_ID] ?? null });
+    for (const [id, c] of room.phones) {
+      const m = this.members.get(c);
+      const info: MemberInfo = { id, role: 'phone', name: room.names[id] ?? null, slot: m?.slot };
+      if (forPc && m?.device) info.device = m.device;
+      list.push(info);
+    }
+    return list;
+  }
+
+  private broadcastRoster(room: Room): void {
+    room.pc?.send({ t: 'roster', members: this.roster(room, true) });
+    const forPhones: ServerMsg = { t: 'roster', members: this.roster(room, false) };
+    for (const c of room.phones.values()) c.send(forPhones);
+  }
+
+  private newMemberId(): MemberId {
+    return `m${randomBytes(9).toString('base64url')}`;
+  }
+
+  private conns(room: Room): Conn[] {
+    return [...(room.pc ? [room.pc] : []), ...room.phones.values()];
   }
 
   /**
    * Remove a connection from its room. `farewell` is sent to the removed connection.
-   * `replacing` skips the peer_left notice because a new connection takes the slot right away.
+   * `replacing` keeps the room alive because a new connection takes the slot right away.
    */
   private removeMember(conn: Conn, farewell: ServerMsg | null, replacing = false): void {
     const m = this.members.get(conn);
@@ -306,10 +408,14 @@ export class RoomHub {
     if (farewell) conn.send(farewell);
     // Vacate the slot first so the floor broadcast doesn't reach the departing connection
     if (m.role === 'pc') room.pc = null;
-    else room.phone = null;
-    if (room.floor === m.role) this.setFloor(room, 'idle');
-    if (!replacing) this.connOf(room, other(m.role))?.send({ t: 'peer_left' });
-    if (!room.pc && !room.phone && !replacing) this.deleteRoom(room);
+    else room.phones.delete(m.id);
+    delete room.names[m.id];
+    // A phone's transmission needs the PC to hear and relay it, so the PC leaving ends it too
+    if (room.floor === m.id || (m.role === 'pc' && room.floor !== 'idle')) this.setFloor(room, 'idle');
+    if (m.role === 'pc') for (const phone of room.phones.values()) phone.send({ t: 'peer_left', id: PC_ID });
+    else room.pc?.send({ t: 'peer_left', id: m.id });
+    this.broadcastRoster(room);
+    if (!room.pc && room.phones.size === 0 && !replacing) this.deleteRoom(room);
   }
 
   private deleteRoom(room: Room): void {
@@ -330,12 +436,7 @@ export class RoomHub {
       }, this.opts.maxTxMs);
     }
     const msg: ServerMsg = { t: 'floor', holder };
-    room.pc?.send(msg);
-    room.phone?.send(msg);
-  }
-
-  private connOf(room: Room, role: Role): Conn | null {
-    return role === 'pc' ? room.pc : room.phone;
+    for (const c of this.conns(room)) c.send(msg);
   }
 }
 
@@ -347,21 +448,44 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
     case 'join':
       if (typeof m.room !== 'string') return null;
       if (m.key !== undefined && typeof m.key !== 'string') return null;
-      return { t: m.t, room: m.room, key: m.key as string | undefined };
+      if (m.v !== undefined && typeof m.v !== 'number') return null;
+      if (m.t === 'join') {
+        if (m.device !== undefined && typeof m.device !== 'string') return null;
+        return { t: 'join', v: m.v as number | undefined, room: m.room, key: m.key as string | undefined, device: m.device as string | undefined };
+      }
+      return { t: 'host', v: m.v as number | undefined, room: m.room, key: m.key as string | undefined };
     case 'signal': {
       const d = m.data as Record<string, unknown> | undefined;
       if (!d || typeof d !== 'object') return null;
+      if (m.to !== undefined && (typeof m.to !== 'string' || !MEMBER_ID_RE.test(m.to))) return null;
+      if (typeof m.cid !== 'string' || !CALL_ID_RE.test(m.cid)) return null;
+      const to = m.to as string | undefined;
+      const cid = m.cid;
       if ((d.kind === 'offer' || d.kind === 'answer') && typeof d.sdp === 'string') {
-        return { t: 'signal', data: { kind: d.kind, sdp: d.sdp } };
+        return { t: 'signal', to, cid, data: { kind: d.kind, sdp: d.sdp } };
       }
       if (d.kind === 'ice' && (d.candidate === null || typeof d.candidate === 'object')) {
-        return { t: 'signal', data: { kind: 'ice', candidate: d.candidate as RTCIceCandidateInit | null } };
+        return { t: 'signal', to, cid, data: { kind: 'ice', candidate: d.candidate as RTCIceCandidateInit | null } };
       }
       return null;
     }
+    case 'kick':
+      if (m.id !== undefined && (typeof m.id !== 'string' || !MEMBER_ID_RE.test(m.id))) return null;
+      return { t: 'kick', id: m.id as string | undefined };
+    case 'names': {
+      if (typeof m.names !== 'object' || m.names === null || Array.isArray(m.names)) return null;
+      const entries = Object.entries(m.names as Record<string, unknown>);
+      if (entries.length > 1 + MAX_PHONES * 10) return null;
+      const names: Record<MemberId, string> = {};
+      for (const [id, v] of entries) {
+        const name = cleanName(v);
+        if (!MEMBER_ID_RE.test(id) || !name) return null;
+        names[id] = name;
+      }
+      return { t: 'names', names };
+    }
     case 'floor_request':
     case 'floor_release':
-    case 'kick':
     case 'pair_create':
       return { t: m.t };
     case 'announce': {

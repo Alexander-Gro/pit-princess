@@ -93,7 +93,8 @@ async function openPair(
   return { pc, phone };
 }
 
-const pcData = (pc: Page) => pc.evaluate(() => window.pit.data);
+// (`from` is the phone's member id; with one phone it's always the same, so it's left out here)
+const pcData = (pc: Page) => pc.evaluate(() => window.pit.data.map(({ msg, valid }) => ({ msg, valid })));
 
 test.describe('mic is opened once per launch', () => {
   test('cycling the noise filter three times never calls getUserMedia again, and audio still flows', async ({ context }) => {

@@ -6,6 +6,10 @@ import './style.css';
 import {
   NOISE_MODES,
   RadioFx,
+  RemoteAudio,
+  generateDeviceId,
+  isDeviceId,
+  type MemberInfo,
   RadioLink,
   RevLights,
   PAIR_CODE_RE,
@@ -55,7 +59,22 @@ const accessKey = (() => {
   }
 })();
 
+// Identifies this phone across reconnects, so it keeps its seat and the name the PC gave it
+const DEVICE_KEY = 'pit-princess-device';
+const device = (() => {
+  try {
+    const saved = localStorage.getItem(DEVICE_KEY);
+    if (isDeviceId(saved)) return saved;
+    const fresh = generateDeviceId();
+    localStorage.setItem(DEVICE_KEY, fresh);
+    return fresh;
+  } catch {
+    return generateDeviceId();
+  }
+})();
+
 let link: RadioLink | null = null;
+let remotes: RemoteAudio | null = null;
 let fx: RadioFx | null = null;
 let micAnalyser: AnalyserNode | null = null;
 let micStream: MediaStream | null = null;
@@ -155,6 +174,8 @@ function claimPairCode(code: string): Promise<{ room: string; key: string }> {
       ws.close();
       if (m.t === 'paired' && m.room && ROOM_CODE_RE.test(m.room)) resolve({ room: m.room, key: m.key ?? '' });
       else if (m.code === 'rate_limited') reject(new Error('Too many wrong codes, wait a few minutes'));
+      else if (m.code === 'room_full')
+        reject(new Error('Two phones are already connected. Kick one on the PC, then try this code again'));
       else reject(new Error('Wrong or expired code. Make a new one on the PC'));
     };
     ws.onerror = () => {
@@ -181,13 +202,21 @@ async function connect(): Promise<void> {
   }
 
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+  remotes = new RemoteAudio(fx.ctx);
   link = new RadioLink({
     role: 'phone',
     wsUrl,
     room,
     accessKey,
+    device,
     fx,
     onChange: render,
+    onRemoteStream: (id, stream) => {
+      if (!fx || !remotes) return;
+      const node = remotes.set(id, stream);
+      if (node) fx.addRemote(id, node);
+      else fx.removeRemote(id);
+    },
     // Each new connection to the PC refreshes its copy of our push subscription
     onDataOpen: () => void sendSubscriptionToPc(link),
     onData: (msg) => {
@@ -361,9 +390,19 @@ function bindPtt(): void {
   window.addEventListener('blur', () => releaseAll());
 }
 
+/** What to call a member: the name the PC gave it, or a default */
+function nameOf(m: MemberInfo | null | undefined): string {
+  if (!m) return 'Someone';
+  return m.name ?? (m.role === 'pc' ? 'Pit wall' : `Phone ${m.slot ?? ''}`.trim());
+}
+
 function render(s: LinkState): void {
+  const roomFull = s.error === 'room_full';
+  const me = s.members.find((m) => m.id === s.selfId);
+  const otherPhones = s.members.filter((m) => m.role === 'phone' && m.id !== s.selfId);
   // Link tile
-  if (s.error && s.signaling === 'closed') setTile('link', 'OFF', 'red');
+  if (roomFull) setTile('link', 'ROOM FULL', 'amber');
+  else if (s.error && s.signaling === 'closed') setTile('link', 'OFF', 'red');
   else if (s.signaling !== 'open') setTile('link', 'SERVER…', 'amber');
   else if (!s.peerPresent) setTile('link', 'PC OFFLINE', 'amber');
   else if (s.peer === 'connected') setTile('link', 'CONNECTED', 'green');
@@ -375,18 +414,25 @@ function render(s: LinkState): void {
   setTile('route', s.route === 'relay' ? 'RELAY' : s.route === 'direct' ? 'DIRECT' : '—', s.route === 'relay' ? 'purple' : null);
 
   // PTT tile
-  $('repair').hidden = !(s.error && s.signaling === 'closed');
-  if (s.error && s.signaling === 'closed') {
-    setPtt('OFFLINE', s.error, 'flag-red');
+  const fatal = !!s.error && !roomFull && s.signaling === 'closed';
+  $('repair').hidden = !fatal;
+  if (roomFull) {
+    // Keeps retrying in the background and joins when a seat frees up
+    setPtt('ROOM FULL', 'Two phones are already connected. Waiting for a free seat', 'flag-amber');
+  } else if (fatal) {
+    setPtt('OFFLINE', s.error!, 'flag-red');
     footMsg.textContent = 'Reload the page to reconnect';
   } else if (s.tx) setPtt('TX', 'Transmitting', 'flag-red pulse');
-  else if (s.rx) setPtt('RX', 'Pit wall talking', 'flag-blue pulse');
+  else if (s.rx) setPtt('RX', `${nameOf(s.talker)} talking`, 'flag-blue pulse');
   else if (s.pending) setPtt('…', 'Keying up', 'flag-amber');
-  else if (s.peer === 'connected') setPtt('HOLD TO TALK', 'Radio ready', 'idle');
+  else if (s.peer === 'connected') {
+    const withWho = otherPhones.length ? ` · with ${otherPhones.map(nameOf).join(', ')}` : '';
+    setPtt('HOLD TO TALK', `You: ${nameOf(me)}${withWho}`, 'idle');
+  }
   else if (!s.peerPresent && s.signaling === 'open') setPtt('WAITING', 'Waiting for the PC', 'disabled');
   else setPtt('LINKING', 'Connecting to the PC', 'disabled');
 
-  if (!s.error) footMsg.textContent = '';
+  if (!fatal) footMsg.textContent = '';
 }
 
 const levelBuf = new Float32Array(512);

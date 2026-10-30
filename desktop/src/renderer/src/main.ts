@@ -7,8 +7,13 @@ import QRCode from 'qrcode';
 import {
   DEFAULT_FX,
   FX_RANGES,
+  MAX_PHONES,
+  PC_ID,
+  PcMixer,
   RadioFx,
   RadioLink,
+  RemoteAudio,
+  type MemberInfo,
   type RadioFxSettings,
   RevLights,
   TxProcessor,
@@ -17,14 +22,13 @@ import {
   generateRoomCode,
   isPhoneToPcMsg,
   MAX_PUSH_SUBS,
-  type PushSub,
   readLevel,
   type CcSoundName,
   type FxFileMsg,
   type LinkState,
 } from '@pit/shared';
 import { createRadioContext, prepareRnnoise } from '@pit/shared/noise';
-import type { CrewChiefResult, JoystickInfo, PitApi, PttBinding, Settings } from '../../common/types';
+import type { CrewChiefResult, JoystickInfo, PitApi, PttBinding, Settings, StoredPushSub } from '../../common/types';
 
 declare global {
   interface Window {
@@ -48,6 +52,10 @@ const pttSources = new Set<'wheel' | 'mouse'>();
 // 48 kHz so the RNNoise model can run
 const ctx = createRadioContext();
 const fx = new RadioFx(ctx);
+/** One audio source per phone, shared by the radio effect (what you hear) and the relay */
+const remotes = new RemoteAudio(ctx);
+/** Builds what each phone hears: your mic plus the other phone, when it's talking */
+const mixer = new PcMixer(ctx);
 const txMeter = new RevLights($('m-tx'), 24);
 const rxMeter = new RevLights($('m-rx'), 24);
 
@@ -104,6 +112,8 @@ async function openMic(deviceId: string): Promise<void> {
   tx.setActive(link?.getState().tx ?? false);
   renderNotches(0);
   link?.setMicTrack(tx.track);
+  // The phones get the mic through the mixer; the link still mutes it unless you transmit
+  mixer.setPcTrack(tx.track);
 }
 
 async function applyOutput(deviceId: string): Promise<void> {
@@ -150,11 +160,12 @@ async function applyCrewChief(res: CrewChiefResult): Promise<void> {
   sendSoundsToPhone();
 }
 
-function sendSoundsToPhone(): void {
+/** Send the Crew Chief sounds to one phone (when its channel opens), or to all after a reload. */
+function sendSoundsToPhone(to?: string): void {
   if (!link) return;
   for (const [name, bytes] of Object.entries(ccFiles)) {
     const msg: FxFileMsg = { t: 'fx', name: name as CcSoundName, b64: bytesToB64(bytes) };
-    link.sendData(msg);
+    link.sendData(msg, to);
   }
 }
 
@@ -173,21 +184,42 @@ function startLink(): void {
     accessKey: settings.accessKey,
     fx,
     onChange: render,
-    onDataOpen: sendSoundsToPhone,
+    sendTrackFor: (id) => mixer.outputFor(id),
+    onRemoteStream: (id, stream) => {
+      const node = remotes.set(id, stream);
+      if (node) {
+        fx.addRemote(id, node);
+        mixer.addRemote(id, node);
+      } else {
+        fx.removeRemote(id);
+        mixer.removePhone(id);
+      }
+    },
+    onDataOpen: (id) => sendSoundsToPhone(id),
     onPairCode: showPairCode,
     onData: onPhoneMessage,
-    onWelcome: () => {
+    onWelcome: (members) => {
+      sentNames = '';
+      sendNames(members);
       // "PC is online" goes out once per app launch, not on every reconnect
-      if (announced || !settings.pushSubs.length) return;
-      if (link?.announce(settings.pushSubs)) announced = true;
+      if (announced) return;
+      const here = new Set(members.map((m) => m.device).filter(Boolean));
+      const phonesHere = members.some((m) => m.role === 'phone');
+      // Only phones that aren't already connected; old untagged ones only if nobody is
+      const subs = settings.pushSubs
+        .filter((e) => (e.device ? !here.has(e.device) : !phonesHere))
+        .map((e) => e.sub);
+      if (!subs.length || link?.announce(subs)) announced = true;
     },
+    onRoster: (members) => sendNames(members),
     onAnnounced: (sent, gone) => {
-      if (gone.length) void updatePushSubs((subs) => subs.filter((s) => !gone.includes(s.endpoint)));
+      if (gone.length) void updatePushSubs((subs) => subs.filter((e) => !gone.includes(e.sub.endpoint)));
       $('v-push').textContent = sent ? `Notified ${sent} phone${sent > 1 ? 's' : ''} that the PC is online.` : pushHint();
     },
   });
   const track = tx?.track ?? null;
   link.setMicTrack(track);
+  mixer.setPcTrack(track);
   lastPeer = 'none';
   link.start();
   render(link.getState());
@@ -221,12 +253,15 @@ function render(s: LinkState): void {
   lastPeer = s.peer;
   tx?.setActive(s.tx);
 
+  mixer.setFloor(s.floor);
+  const phones = s.members.filter((m) => m.role === 'phone');
+  const connected = s.peers.filter((p) => p.status === 'connected').length;
   if (s.error && s.signaling === 'closed') {
     setTile('link', 'DENIED', 'red');
     $('v-server').textContent = s.error;
   } else if (s.signaling !== 'open') setTile('link', 'SERVER…', 'amber');
-  else if (!s.peerPresent) setTile('link', 'NO PHONE', null);
-  else if (s.peer === 'connected') setTile('link', 'CONNECTED', 'green');
+  else if (!phones.length) setTile('link', 'NO PHONE', null);
+  else if (connected) setTile('link', connected > 1 ? `${connected} PHONES` : 'CONNECTED', 'green');
   else if (s.peer === 'failed') setTile('link', 'FAILED', 'red');
   else setTile('link', 'LINKING', 'amber');
 
@@ -234,14 +269,105 @@ function render(s: LinkState): void {
   else if (s.rx) setTile('state', 'RX', 'blue', true);
   else if (s.pending) setTile('state', 'KEYING', 'amber');
   else setTile('state', 'STANDBY', null);
-  $('l-state').textContent = s.tx ? 'Transmitting' : s.rx ? 'Phone talking' : 'Radio';
+  $('l-state').textContent = s.tx ? 'Transmitting' : s.rx ? `${phoneName(s.talker)} talking` : 'Radio';
 
   setTile('ping', s.rttMs == null ? '—' : `${s.rttMs} ms`, null);
   setTile('route', s.route === 'relay' ? 'RELAY' : s.route === 'direct' ? 'DIRECT' : '—', s.route === 'relay' ? 'purple' : null);
 
-  // The code is single-use: once the phone is in, hide it
-  if (s.peer === 'connected' && pairTimer) clearPairCode('Phone paired.');
-  $('v-phone').textContent = !s.peerPresent ? 'No phone' : s.peer === 'connected' ? 'Phone connected' : 'Phone linking…';
+  // The code is single-use: hide it once a phone we hadn't seen arrives. A phone that just
+  // reconnects (same device) must not hide a code someone is still typing in.
+  const devices = phones.map((m) => m.device ?? m.id);
+  if (pairTimer && devices.some((d) => !seenDevices.has(d))) clearPairCode('Phone paired.');
+  for (const d of devices) seenDevices.add(d);
+  const full = phones.length >= MAX_PHONES;
+  const pairBtn = $<HTMLButtonElement>('b-paircode');
+  pairBtn.disabled = full;
+  pairBtn.title = full ? `Room is full (${MAX_PHONES}/${MAX_PHONES}). Kick a phone to pair another.` : '';
+  renderPhones(s);
+}
+
+/** Devices seen this session, so a reconnecting phone isn't mistaken for a newly paired one */
+const seenDevices = new Set<string>();
+
+/** What a phone is called: the name you gave it, or "Phone 1/2" */
+function phoneName(m: MemberInfo | null | undefined): string {
+  if (!m) return 'Phone';
+  if (m.role === 'pc') return settings.pcName;
+  return (m.device && settings.deviceNames[m.device]) || m.name || `Phone ${m.slot ?? ''}`.trim();
+}
+
+/** The phone rows. Rows are kept (not rebuilt) so typing a name isn't interrupted. */
+function renderPhones(s: LinkState): void {
+  const list = $('phones');
+  const phones = s.members.filter((m) => m.role === 'phone');
+  $('l-phones').textContent = `Phones (${phones.length}/${MAX_PHONES})`;
+  const rows = new Map([...list.querySelectorAll<HTMLElement>('.phone-row')].map((r) => [r.dataset.id!, r]));
+  for (const [id, row] of rows) if (!phones.some((p) => p.id === id)) row.remove();
+  list.querySelector('.empty')?.remove();
+  if (!phones.length) list.insertAdjacentHTML('beforeend', '<span class="hint empty">No phone connected</span>');
+  for (const m of phones) {
+    let row = rows.get(m.id);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'phone-row';
+      row.dataset.id = m.id;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.maxLength = 24;
+      input.spellcheck = false;
+      input.title = 'Click to rename this phone';
+      input.addEventListener('change', () => void renamePhone(m, input.value));
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') input.blur();
+      });
+      const status = document.createElement('span');
+      status.className = 'status';
+      const kick = document.createElement('button');
+      kick.className = 'btn small';
+      kick.type = 'button';
+      kick.textContent = 'Kick';
+      kick.title = 'Disconnect this phone. It can rejoin with the link; use New code to lock it out.';
+      kick.addEventListener('click', () => link?.kick(m.id));
+      row.append(input, status, kick);
+      list.appendChild(row);
+    }
+    const input = row.querySelector('input')!;
+    if (document.activeElement !== input) input.value = phoneName(m);
+    input.placeholder = `Phone ${m.slot ?? ''}`.trim();
+    const peer = s.peers.find((p) => p.id === m.id);
+    const status = row.querySelector<HTMLElement>('.status')!;
+    status.textContent =
+      peer?.status === 'connected' ? (peer.rttMs != null ? `${peer.rttMs} ms` : 'connected') : peer?.status === 'failed' ? 'failed' : 'linking…';
+    status.classList.toggle('ok', peer?.status === 'connected');
+    row.classList.toggle('talking', s.floor === m.id);
+  }
+}
+
+async function renamePhone(m: MemberInfo, value: string): Promise<void> {
+  if (!m.device) return;
+  const names = { ...settings.deviceNames };
+  const name = value.trim();
+  // Re-insert so a renamed phone counts as recently used when old names are dropped
+  delete names[m.device];
+  if (name) names[m.device] = name.slice(0, 24);
+  settings = await pit.setSettings({ deviceNames: names });
+  sendNames(link?.getState().members ?? []);
+  if (link) render(link.getState());
+}
+
+let sentNames = '';
+
+/** Tell the server the names to show on the phones (by member id), when they change. */
+function sendNames(members: MemberInfo[]): void {
+  const names: Record<string, string> = { [PC_ID]: settings.pcName };
+  for (const m of members) {
+    const n = m.role === 'phone' && m.device ? settings.deviceNames[m.device] : undefined;
+    if (n) names[m.id] = n;
+  }
+  const json = JSON.stringify(names);
+  if (json === sentNames) return;
+  sentNames = json;
+  link?.setNames(names);
 }
 
 // ---------- push notifications ----------
@@ -259,7 +385,7 @@ let pushSave: Promise<void> = Promise.resolve();
  * Change the stored subscriptions. Updates are chained, and each one starts from the result of
  * the previous, so overlapping changes (a new phone + an expired one) can't overwrite each other.
  */
-function updatePushSubs(change: (subs: PushSub[]) => PushSub[]): Promise<void> {
+function updatePushSubs(change: (subs: StoredPushSub[]) => StoredPushSub[]): Promise<void> {
   pushSave = pushSave
     .then(async () => {
       settings = await pit.setSettings({ pushSubs: change(settings.pushSubs) });
@@ -269,15 +395,22 @@ function updatePushSubs(change: (subs: PushSub[]) => PushSub[]): Promise<void> {
   return pushSave;
 }
 
-function onPhoneMessage(msg: unknown): void {
+function onPhoneMessage(msg: unknown, from: string): void {
   if (!isPhoneToPcMsg(msg)) return;
+  // Which device sent it, so "PC online" can skip phones that are already connected
+  const device = link?.getState().members.find((m) => m.id === from)?.device ?? null;
   if (msg.t === 'push_sub') {
     const sub = msg.sub;
-    // Newest first; drop the oldest beyond the limit
-    void updatePushSubs((subs) => [sub, ...subs.filter((s) => s.endpoint !== sub.endpoint)].slice(0, MAX_PUSH_SUBS));
+    // Newest first, one entry per device; drop the oldest beyond the limit
+    void updatePushSubs((subs) =>
+      [{ device, sub }, ...subs.filter((e) => e.sub.endpoint !== sub.endpoint && (!device || e.device !== device))].slice(
+        0,
+        MAX_PUSH_SUBS,
+      ),
+    );
   } else {
     const endpoint = msg.endpoint;
-    void updatePushSubs((subs) => subs.filter((s) => s.endpoint !== endpoint));
+    void updatePushSubs((subs) => subs.filter((e) => e.sub.endpoint !== endpoint));
   }
 }
 
@@ -413,7 +546,23 @@ function wireUi(): void {
     await updatePushSubs(() => []);
     startLink();
   });
-  $('b-kick').addEventListener('click', () => link?.kick());
+  const pcName = $<HTMLInputElement>('i-pcname');
+  pcName.value = settings.pcName;
+  pcName.addEventListener('change', async () => {
+    settings = await pit.setSettings({ pcName: pcName.value });
+    pcName.value = settings.pcName;
+    sendNames(link?.getState().members ?? []);
+  });
+  pcName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') pcName.blur();
+  });
+  const relay = $<HTMLInputElement>('c-relay');
+  relay.checked = settings.relayPhones;
+  mixer.setRelayEnabled(settings.relayPhones);
+  relay.addEventListener('change', async () => {
+    settings = await pit.setSettings({ relayPhones: relay.checked });
+    mixer.setRelayEnabled(relay.checked);
+  });
   $('b-paircode').addEventListener('click', () => {
     if (!link?.createPairCode()) clearPairCode('Not connected to the server yet.');
   });

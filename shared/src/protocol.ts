@@ -1,7 +1,56 @@
 // Wire protocol between the clients (PC + phone) and the signaling server.
 
 export type Role = 'pc' | 'phone';
-export type FloorHolder = 'idle' | Role;
+/** A room member: 'pc' for the PC, the phone's device id for a phone */
+export type MemberId = string;
+export const PC_ID = 'pc';
+/** 'idle' or the id of the member who is talking */
+export type FloorHolder = 'idle' | MemberId;
+
+/** Phones allowed in a room at once (plus the PC) */
+export const MAX_PHONES = 2;
+/** Phone device ids: random base64url, kept in the phone's storage */
+export const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+export const MAX_NAME_LEN = 24;
+
+/** Protocol version sent in host/join; older clients are told to update */
+export const PROTOCOL_VERSION = 2;
+
+/** Member ids: 'pc', or a random id the server gives each phone connection */
+export const MEMBER_ID_RE = /^(pc|[A-Za-z0-9_-]{4,64})$/;
+/** Call id: ties offer/answer/ICE to one RTCPeerConnection attempt */
+export const CALL_ID_RE = /^[A-Za-z0-9_-]{4,32}$/;
+
+export interface MemberInfo {
+  id: MemberId;
+  role: Role;
+  /** Set by the PC; null when it hasn't named this device */
+  name: string | null;
+  /** Phones: stable seat number 1..MAX_PHONES while connected */
+  slot?: number;
+  /** Phones: the device id. Only included in the PC's copy of the roster. */
+  device?: string;
+}
+
+export function isDeviceId(v: unknown): v is string {
+  return typeof v === 'string' && DEVICE_ID_RE.test(v) && v !== PC_ID && v !== 'idle';
+}
+
+/** Trim and validate a display name; null if unusable. */
+export function cleanName(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  // No control characters; collapse whitespace
+  const s = v
+    .replace(/[\t\n\r]/g, ' ')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return s.length >= 1 && s.length <= MAX_NAME_LEN ? s : null;
+}
+
+export function generateDeviceId(): string {
+  return generateRoomCode();
+}
 
 export const ROOM_CODE_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
@@ -70,12 +119,17 @@ export function isPhoneToPcMsg(v: unknown): v is PhoneToPcMsg {
 
 export type ClientMsg =
   /** `key` is the server's access key, required when the server sets ACCESS_KEY */
-  | { t: 'host'; room: string; key?: string }
-  | { t: 'join'; room: string; key?: string }
-  | { t: 'signal'; data: SignalData }
+  | { t: 'host'; v?: number; room: string; key?: string }
+  /** `device` identifies the phone across reconnects (one slot per device) */
+  | { t: 'join'; v?: number; room: string; key?: string; device?: string }
+  /** `to` (PC only): the phone it's for. Phones always signal the PC. */
+  | { t: 'signal'; to?: MemberId; cid: string; data: SignalData }
   | { t: 'floor_request' }
   | { t: 'floor_release' }
-  | { t: 'kick' }
+  /** PC: kick one phone, or every phone when `id` is omitted */
+  | { t: 'kick'; id?: MemberId }
+  /** PC: display names for itself ('pc') and the phones (by member id) */
+  | { t: 'names'; names: Record<MemberId, string> }
   /** PC: create a short pairing code for this room */
   | { t: 'pair_create' }
   /** Phone (no room or key yet): trade a pairing code for the room and key */
@@ -83,13 +137,16 @@ export type ClientMsg =
   /** PC: "I'm online" — notify these phones if none of them is connected yet */
   | { t: 'announce'; subs: PushSub[] };
 
-export type ErrorCode = 'bad_room' | 'no_host' | 'not_in_room' | 'bad_message' | 'unauthorized' | 'bad_code' | 'rate_limited';
+export type ErrorCode = 'bad_room' | 'no_host' | 'not_in_room' | 'bad_message' | 'unauthorized' | 'bad_code' | 'rate_limited' | 'room_full' | 'update_required';
 
 export type ServerMsg =
-  | { t: 'welcome'; role: Role; iceServers: RTCIceServer[]; peerPresent: boolean; floor: FloorHolder }
-  | { t: 'peer_joined' }
-  | { t: 'peer_left' }
-  | { t: 'signal'; data: SignalData }
+  | { t: 'welcome'; role: Role; you: MemberId; iceServers: RTCIceServer[]; floor: FloorHolder; members: MemberInfo[] }
+  /** Everyone in the room, sent whenever someone joins, leaves or is renamed */
+  | { t: 'roster'; members: MemberInfo[] }
+  /** A peer to set up WebRTC with arrived/left (phones are only told about the PC) */
+  | { t: 'peer_joined'; id: MemberId }
+  | { t: 'peer_left'; id: MemberId }
+  | { t: 'signal'; from: MemberId; cid: string; data: SignalData }
   | { t: 'floor'; holder: FloorHolder }
   | { t: 'busy' }
   | { t: 'pair_code'; code: string; expiresInMs: number }

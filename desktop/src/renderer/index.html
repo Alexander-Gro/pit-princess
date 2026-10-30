@@ -22,24 +22,27 @@
         <div class="meter-row"><span class="label">RX</span><div id="m-rx"></div></div>
       </div>
 
-      <!-- Pairing -->
+      <!-- Phones + pairing -->
       <section class="tile pair">
-        <span class="label">Pair phone</span>
+        <span class="label" id="l-phones">Phones (0/2)</span>
         <div class="pair-body">
           <canvas id="qr" width="168" height="168"></canvas>
           <div class="pair-info">
-            <span class="value small" id="v-phone">No phone</span>
+            <label class="name-row" title="Shown on the phones">This PC
+              <input type="text" id="i-pcname" maxlength="24" spellcheck="false" />
+            </label>
+            <div id="phones" class="phones"><span class="hint empty">No phone connected</span></div>
             <a id="phone-link" class="link" href="#" target="_blank">—</a>
             <div class="row">
               <button class="btn" id="b-copy" type="button">Copy link</button>
-              <button class="btn" id="b-newcode" type="button">New code</button>
-              <button class="btn" id="b-kick" type="button">Kick</button>
-            </div>
-            <div class="row">
+              <button class="btn" id="b-newcode" type="button" title="Disconnects every phone and makes a new link">New code</button>
               <button class="btn primary" id="b-paircode" type="button">Pairing code</button>
               <span class="paircode" id="v-paircode" hidden></span>
             </div>
             <span class="hint" id="v-paircode-hint">For a home-screen app on iPhone: show a code and type it on the phone.</span>
+            <label class="check" title="Off stops the phones hearing each other. Use it if both phones are in the same room and it howls.">
+              <span><input type="checkbox" id="c-relay" /> Phones hear each other</span>
+            </label>
             <span class="hint" id="v-push"></span>
           </div>
         </div>

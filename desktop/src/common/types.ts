@@ -23,10 +23,25 @@ export interface Settings {
   micGain: number;
   feedbackSuppression: boolean;
   noise: NoiseMode;
-  /** Phones to notify when this PC comes online (their Web Push subscriptions) */
-  pushSubs: PushSub[];
+  /** Phones to notify when this PC comes online, by the device that subscribed */
+  pushSubs: StoredPushSub[];
+  /** This PC's name, shown on the phones */
+  pcName: string;
+  /** Names the PC gave phones, by device id */
+  deviceNames: Record<string, string>;
+  /** Let phones hear each other (the PC relays). Off avoids howling when both phones share a room. */
+  relayPhones: boolean;
   ccFolder: string | null;
 }
+
+export interface StoredPushSub {
+  /** Device id of the phone that subscribed; null for subscriptions saved before multi-phone */
+  device: string | null;
+  sub: PushSub;
+}
+
+/** At most this many phone names are remembered */
+export const MAX_DEVICE_NAMES = 20;
 
 export interface JoystickInfo {
   path: string;

@@ -240,3 +240,62 @@ label {
 .sliders:not(.mic) {
   grid-template-columns: repeat(4, 1fr);
 }
+
+/* Phones list in the pairing tile */
+.name-row {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.phones {
+  display: grid;
+  gap: 4px;
+}
+
+.phone-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  background: var(--tile-2);
+  border-radius: 6px;
+  padding: 3px 4px 3px 8px;
+}
+
+.phone-row input {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 2px 4px;
+  font-weight: 700;
+}
+
+.phone-row input:hover,
+.phone-row input:focus {
+  border-color: var(--line);
+  outline: none;
+}
+
+.phone-row .status {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.phone-row .status.ok {
+  color: var(--green);
+}
+
+.phone-row.talking {
+  background: var(--blue);
+}
+
+.phone-row.talking .status {
+  color: var(--text);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  filter: none;
+}

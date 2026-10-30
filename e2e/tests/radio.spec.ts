@@ -69,7 +69,11 @@ test('phone and PC connect, key up, get busy, and release', async ({ context }) 
   await phone.mouse.down();
   await expect(pttText).toHaveText('TX');
   await expect.poll(async () => (await pcState(pc)).rx).toBe(true);
-  expect((await pcState(pc)).floor).toBe('phone');
+  // The floor holder is the phone's server-assigned member id
+  const s = await pc.evaluate(() => window.pit.state!);
+  const phoneId = s.members.find((m) => m.role === 'phone')!.id;
+  expect(phoneId).toMatch(/^m[A-Za-z0-9_-]{12}$/);
+  expect(s.floor).toBe(phoneId);
   // ...and the fake mic's tone actually reaches the PC while transmitting (higher bitrate than encoded silence) (much higher bitrate)
   const tx0 = await energy();
   await pc.waitForTimeout(1000);

@@ -96,8 +96,8 @@ export class RadioFx {
   private staticGain: GainNode;
   private bleepGain: GainNode;
   private outEl: HTMLAudioElement | null = null;
-  private remoteSource: MediaStreamAudioSourceNode | null = null;
-  private remoteEl: HTMLAudioElement | null = null;
+  /** Remote voices (from RemoteAudio), summed into the voice chain */
+  private remotes = new Map<string, AudioNode>();
   private sounds = new Map<CcSoundName, AudioBuffer>();
   private settings: RadioFxSettings = { ...DEFAULT_FX };
   private open = false;
@@ -274,23 +274,22 @@ export class RadioFx {
     return this.sounds.has(name);
   }
 
-  setRemoteStream(stream: MediaStream | null): void {
-    this.remoteSource?.disconnect();
-    this.remoteSource = null;
-    if (this.remoteEl) {
-      this.remoteEl.srcObject = null;
-      this.remoteEl = null;
+  /** Add a remote voice (a node from RemoteAudio). Several can play at once; the gate opens on floor. */
+  addRemote(id: string, node: AudioNode): void {
+    this.removeRemote(id);
+    node.connect(this.voiceIn);
+    this.remotes.set(id, node);
+  }
+
+  removeRemote(id: string): void {
+    const node = this.remotes.get(id);
+    if (!node) return;
+    try {
+      node.disconnect(this.voiceIn);
+    } catch {
+      /* already disconnected */
     }
-    if (!stream) return;
-    // Chrome only feeds a remote WebRTC stream into Web Audio if a media element is also playing it.
-    const el = new Audio();
-    el.muted = true;
-    el.setAttribute('playsinline', '');
-    el.srcObject = stream;
-    el.play().catch(() => {});
-    this.remoteEl = el;
-    this.remoteSource = this.ctx.createMediaStreamSource(stream);
-    this.remoteSource.connect(this.voiceIn);
+    this.remotes.delete(id);
   }
 
   /** The far side keyed up. */
@@ -309,8 +308,8 @@ export class RadioFx {
     this.voiceGate.gain.setTargetAtTime(1, t, 0.01);
   }
 
-  /** The far side released. The channel closes after a short tail. */
-  closeChannel(immediate = false): void {
+  /** The far side released. The channel closes after a short tail (longer for relayed audio). */
+  closeChannel(immediate = false, tailMs = RX_TAIL_MS): void {
     if (!this.open || this.closeTimer) return;
     const doClose = () => {
       this.closeTimer = null;
@@ -323,7 +322,7 @@ export class RadioFx {
       this.play('end_bleep');
     };
     if (immediate) doClose();
-    else this.closeTimer = setTimeout(doClose, RX_TAIL_MS);
+    else this.closeTimer = setTimeout(doClose, tailMs);
   }
 
   isOpen(): boolean {

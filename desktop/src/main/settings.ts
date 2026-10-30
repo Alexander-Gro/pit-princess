@@ -2,7 +2,7 @@ import { app } from 'electron';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DEFAULT_FX } from '@pit/shared';
-import type { Settings } from '../common/types';
+import type { Settings, StoredPushSub } from '../common/types';
 
 const DEFAULTS: Settings = {
   serverUrl: process.env.PIT_SERVER_URL ?? 'http://localhost:8787',
@@ -16,6 +16,9 @@ const DEFAULTS: Settings = {
   feedbackSuppression: true,
   noise: 'strong',
   pushSubs: [],
+  pcName: 'Pit wall',
+  deviceNames: {},
+  relayPhones: true,
   ccFolder: null,
 };
 
@@ -34,6 +37,10 @@ export function loadSettings(): Settings {
     console.warn('[settings] unreadable, using defaults', e);
   }
   cache = { ...DEFAULTS, ...stored, fx: { ...DEFAULTS.fx, ...(stored.fx ?? {}) } };
+  // Before multi-phone, subscriptions were stored bare; keep them, not tied to a device
+  cache.pushSubs = (cache.pushSubs as unknown[]).map((e) =>
+    e && typeof e === 'object' && 'endpoint' in e ? { device: null, sub: e as StoredPushSub['sub'] } : (e as StoredPushSub),
+  );
   return cache;
 }
 
