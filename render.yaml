@@ -15,6 +15,12 @@ services:
       # Use a long random string and enter the same key in the PC app.
       - key: ACCESS_KEY
         sync: false
+      # Push notifications ("PC is online" on the phone). Generate a pair with:
+      #   npx web-push generate-vapid-keys
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
       # TURN relay credentials: fill in ONE provider in the Render dashboard
       - key: CF_TURN_KEY_ID
         sync: false

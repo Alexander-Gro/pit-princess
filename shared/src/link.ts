@@ -1,7 +1,7 @@
 // RadioLink: signaling socket + WebRTC peer + push-to-talk floor control.
 // Used by both the phone PWA and the desktop app; only the role differs.
 
-import type { ClientMsg, FloorHolder, Role, ServerMsg, SignalData } from './protocol.ts';
+import type { ClientMsg, FloorHolder, PushSub, Role, ServerMsg, SignalData } from './protocol.ts';
 import type { RadioFx } from './radio.ts';
 
 /** Keep the mic open briefly after PTT release so the last syllable isn't clipped. */
@@ -40,6 +40,10 @@ export interface RadioLinkOptions {
   onDataOpen?: () => void;
   /** A pairing code the server created for this room (PC only) */
   onPairCode?: (code: string, expiresInMs: number) => void;
+  /** We (re)entered the room: the server accepted our host/join */
+  onWelcome?: (peerPresent: boolean) => void;
+  /** Result of announce(): push subscriptions the push service reported gone */
+  onAnnounced?: (sent: number, gone: string[]) => void;
 }
 
 export class RadioLink {
@@ -116,6 +120,13 @@ export class RadioLink {
   createPairCode(): boolean {
     if (this.role !== 'pc' || this.ws?.readyState !== WebSocket.OPEN) return false;
     this.send({ t: 'pair_create' });
+    return true;
+  }
+
+  /** Tell the server we're online so it can notify these phones (PC only). */
+  announce(subs: PushSub[]): boolean {
+    if (this.role !== 'pc' || this.ws?.readyState !== WebSocket.OPEN || subs.length === 0) return false;
+    this.send({ t: 'announce', subs });
     return true;
   }
 
@@ -231,12 +242,16 @@ export class RadioLink {
         this.iceServers = msg.iceServers;
         this.update({ peerPresent: msg.peerPresent });
         this.forceFloor(msg.floor);
+        this.opts.onWelcome?.(msg.peerPresent);
         // The server told the phone peer_left when our socket dropped, so it has torn down
         // its side. Always start a fresh call even if our old connection still looks alive.
         if (this.role === 'pc' && msg.peerPresent) void this.startCall();
         break;
       case 'ice':
         this.iceServers = msg.iceServers;
+        break;
+      case 'announced':
+        this.opts.onAnnounced?.(msg.sent, msg.gone);
         break;
       case 'pair_code':
         this.opts.onPairCode?.(msg.code, msg.expiresInMs);
@@ -385,7 +400,16 @@ export class RadioLink {
 
   private attachChannel(dc: RTCDataChannel): void {
     this.dc = dc;
-    dc.onopen = () => this.opts.onDataOpen?.();
+    // A channel from ondatachannel may already be open (and may or may not still get 'open'),
+    // so fire once from whichever comes first.
+    let fired = false;
+    const opened = () => {
+      if (fired || this.dc !== dc) return;
+      fired = true;
+      this.opts.onDataOpen?.();
+    };
+    dc.onopen = opened;
+    if (dc.readyState === 'open') queueMicrotask(opened);
     dc.onmessage = (ev) => {
       if (typeof ev.data !== 'string') return;
       try {

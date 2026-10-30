@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { Joysticks, matchesBinding } from './joystick';
 import { loadSettings, saveSettings } from './settings';
 import { loadCrewChief, resolveFxFolder } from './crewchief';
-import { NOISE_MODES, ROOM_CODE_RE, clampFx } from '@pit/shared';
+import { MAX_PUSH_SUBS, NOISE_MODES, ROOM_CODE_RE, clampFx, isPushSub } from '@pit/shared';
 import type { Settings } from '../common/types';
 
 // Dev/test aid: run with a throwaway settings folder
@@ -151,6 +151,9 @@ function sanitizePatch(patch: Partial<Settings>): Partial<Settings> {
     out.micGain = Math.max(0, Math.min(2, patch.micGain));
   }
   if (typeof patch.feedbackSuppression === 'boolean') out.feedbackSuppression = patch.feedbackSuppression;
+  if (Array.isArray(patch.pushSubs) && patch.pushSubs.length <= MAX_PUSH_SUBS && patch.pushSubs.every(isPushSub)) {
+    out.pushSubs = patch.pushSubs;
+  }
   if (typeof patch.noise === 'string' && NOISE_MODES.includes(patch.noise)) out.noise = patch.noise;
   return out;
 }

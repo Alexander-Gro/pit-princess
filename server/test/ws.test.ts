@@ -108,7 +108,8 @@ describe('real server over WebSocket', () => {
   it('serves healthz, api/info and the phone app shell', async () => {
     expect(await (await fetch(`http://127.0.0.1:${port}/healthz`)).text()).toBe('ok');
     const info = await (await fetch(`http://127.0.0.1:${port}/api/info`)).json();
-    expect(info).toEqual({ publicUrl: `http://localhost:${port}` });
+    // The test server runs without VAPID keys, so push is off
+    expect(info).toEqual({ publicUrl: `http://localhost:${port}`, vapidPublicKey: null });
     const page = await fetch(`http://127.0.0.1:${port}/some/deep/link`);
     expect(page.status).toBe(200);
     expect(page.headers.get('content-type')).toContain('text/html');

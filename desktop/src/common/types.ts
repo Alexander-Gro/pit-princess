@@ -1,6 +1,6 @@
 // Types shared by the Electron main process, preload and renderer.
 
-import type { CcSoundName, NoiseMode, RadioFxSettings } from '@pit/shared';
+import type { CcSoundName, NoiseMode, PushSub, RadioFxSettings } from '@pit/shared';
 
 export interface PttBinding {
   /** OS device path; distinguishes two identical devices */
@@ -23,6 +23,8 @@ export interface Settings {
   micGain: number;
   feedbackSuppression: boolean;
   noise: NoiseMode;
+  /** Phones to notify when this PC comes online (their Web Push subscriptions) */
+  pushSubs: PushSub[];
   ccFolder: string | null;
 }
 

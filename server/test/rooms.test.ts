@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ServerMsg } from '@pit/shared';
+import { isPhoneToPcMsg, isPushEndpoint, isPushSub, type ServerMsg } from '@pit/shared';
 import { RoomHub, type Conn } from '../src/rooms.ts';
 
 const ROOM = 'room-AAAAAAAAAAAAAAAA';
@@ -759,5 +759,444 @@ describe('pairing codes', () => {
     const late = new FakeConn('late');
     await hub.handle(late, { t: 'pair_claim', code });
     expect(late.take()).toEqual([{ t: 'error', code: 'rate_limited' }]);
+  });
+});
+
+// ---------- "PC is online" push announce ----------
+
+const SUB_A = { endpoint: 'https://web.push.apple.com/QGuQyavXutnMH', keys: { p256dh: 'BPa', auth: 'aa' } };
+const SUB_B = { endpoint: 'https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM', keys: { p256dh: 'BPb', auth: 'bb' } };
+const FCM = 'https://fcm.googleapis.com/fcm/send/';
+
+class FakePusher {
+  calls: { subs: unknown[]; payload: object }[] = [];
+  result: { sent: number; gone: string[] } = { sent: 0, gone: [] };
+  error: Error | null = null;
+  async send(subs: unknown[], payload: object) {
+    this.calls.push({ subs, payload });
+    if (this.error) throw this.error;
+    return this.result;
+  }
+}
+
+async function pcAlone(hub: RoomHub, room = ROOM) {
+  const pc = new FakeConn('pc');
+  await hub.handle(pc, { t: 'host', room });
+  pc.take();
+  return pc;
+}
+
+describe('announce (push "PC is online")', () => {
+  it('sends to the pusher when no phone is in the room and replies with the result', async () => {
+    const push = new FakePusher();
+    push.result = { sent: 2, gone: [] };
+    const hub = makeHub({ push });
+    const pc = await pcAlone(hub);
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A, SUB_B] });
+    expect(push.calls).toHaveLength(1);
+    expect(push.calls[0].subs).toEqual([SUB_A, SUB_B]);
+    expect(push.calls[0].payload).toMatchObject({ title: 'Pit Princess', tag: 'pc-online' });
+    expect(pc.take()).toEqual([{ t: 'announced', sent: 2, gone: [] }]);
+  });
+
+  it('skips when a phone is already in the room', async () => {
+    const push = new FakePusher();
+    const { hub, pc } = await setup(makeHub({ push }));
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+    expect(push.calls).toHaveLength(0);
+    expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+  });
+
+  it('a skipped announce (phone present) does not start the cooldown', async () => {
+    const push = new FakePusher();
+    const { hub, pc, phone } = await setup(makeHub({ push }));
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+    hub.disconnect(phone);
+    pc.take();
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+    expect(push.calls).toHaveLength(1);
+  });
+
+  it('with no pusher configured nothing is sent, but the PC still gets a reply', async () => {
+    const hub = makeHub(); // push defaults to null
+    const pc = await pcAlone(hub);
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+    expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+    const hub2 = makeHub({ push: null });
+    const pc2 = await pcAlone(hub2);
+    await hub2.handle(pc2, { t: 'announce', subs: [SUB_A] });
+    expect(pc2.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+  });
+
+  it('an empty subs list sends nothing and does not use up the cooldown', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const pc = await pcAlone(hub);
+    await hub.handle(pc, { t: 'announce', subs: [] });
+    expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+    expect(push.calls).toHaveLength(1);
+  });
+
+  it('honours the cooldown per room (announceCooldownMs), across PC reconnects', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push, announceCooldownMs: 1000 });
+      const pc = await pcAlone(hub);
+      await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(1);
+      pc.take();
+
+      // Within the cooldown: skipped, even from a fresh PC connection to the same room
+      vi.advanceTimersByTime(999);
+      await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+      hub.disconnect(pc);
+      const pc2 = await pcAlone(hub);
+      await hub.handle(pc2, { t: 'announce', subs: [SUB_A] });
+      expect(pc2.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+      expect(push.calls).toHaveLength(1);
+
+      // Another room is not affected
+      const other = await pcAlone(hub, ROOM2);
+      await hub.handle(other, { t: 'announce', subs: [SUB_B] });
+      expect(push.calls).toHaveLength(2);
+
+      // After the cooldown: sent again
+      vi.advanceTimersByTime(1);
+      await hub.handle(pc2, { t: 'announce', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the default cooldown is 2 minutes', async () => {
+    vi.useFakeTimers();
+    try {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const pc = await pcAlone(hub);
+      await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      vi.advanceTimersByTime(120_000 - 1);
+      await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+      expect(push.calls).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('concurrent announces for one room only send once', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const pc = await pcAlone(hub);
+    await Promise.all([hub.handle(pc, { t: 'announce', subs: [SUB_A] }), hub.handle(pc, { t: 'announce', subs: [SUB_A] })]);
+    expect(push.calls).toHaveLength(1);
+    expect(pc.take()).toHaveLength(2);
+  });
+
+  it('only the PC role can announce', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const pc = new FakeConn('pc');
+    await hub.handle(pc, { t: 'host', room: ROOM });
+    const phone = new FakeConn('phone');
+    await hub.handle(phone, { t: 'join', room: ROOM });
+    hub.disconnect(pc); // phone alone in the room: "a phone is present" can't be what stops it
+    phone.take();
+    await hub.handle(phone, { t: 'announce', subs: [SUB_A] });
+    expect(push.calls).toHaveLength(0);
+    expect(phone.take()).toEqual([]);
+  });
+
+  it('connections that are not in a room cannot announce', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    await pcAlone(hub);
+    const stranger = new FakeConn('stranger');
+    await hub.handle(stranger, { t: 'announce', subs: [SUB_A] });
+    expect(stranger.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+    expect(push.calls).toHaveLength(0);
+  });
+
+  it('a host refused for a wrong access key cannot announce', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push, accessKey: 'secret-key' });
+    const bad = new FakeConn('bad');
+    await hub.handle(bad, { t: 'host', room: ROOM, key: 'wrong' });
+    expect(bad.take()).toEqual([{ t: 'error', code: 'unauthorized' }]);
+    await hub.handle(bad, { t: 'announce', subs: [SUB_A] });
+    expect(bad.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+    expect(push.calls).toHaveLength(0);
+  });
+
+  it('a PC replaced by a newer PC cannot announce any more', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const old = await pcAlone(hub);
+    const fresh = new FakeConn('fresh');
+    await hub.handle(fresh, { t: 'host', room: ROOM });
+    old.take();
+    await hub.handle(old, { t: 'announce', subs: [SUB_A] });
+    expect(old.take()).toEqual([{ t: 'error', code: 'not_in_room' }]);
+    expect(push.calls).toHaveLength(0);
+  });
+
+  it('passes gone endpoints through to the PC', async () => {
+    const push = new FakePusher();
+    push.result = { sent: 1, gone: [SUB_B.endpoint] };
+    const hub = makeHub({ push });
+    const pc = await pcAlone(hub);
+    await hub.handle(pc, { t: 'announce', subs: [SUB_A, SUB_B] });
+    expect(pc.take()).toEqual([{ t: 'announced', sent: 1, gone: [SUB_B.endpoint] }]);
+  });
+
+  it('pusher.send throwing still produces a reply (and does not reject handle)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const push = new FakePusher();
+      push.error = new Error('push service down');
+      const hub = makeHub({ push });
+      const pc = await pcAlone(hub);
+      await expect(hub.handle(pc, { t: 'announce', subs: [SUB_A] })).resolves.toBeUndefined();
+      expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('only forwards endpoint and keys to the pusher (extra fields are stripped)', async () => {
+    const push = new FakePusher();
+    const hub = makeHub({ push });
+    const pc = await pcAlone(hub);
+    await hub.handle(pc, {
+      t: 'announce',
+      subs: [{ ...SUB_A, expirationTime: null, extra: 'x', keys: { ...SUB_A.keys, junk: 1 } }],
+    });
+    expect(push.calls[0].subs).toEqual([SUB_A]);
+  });
+
+  describe('parser rejects invalid subs with bad_message', () => {
+    const cases: [string, unknown][] = [
+      ['http endpoint', [{ ...SUB_A, endpoint: 'http://fcm.googleapis.com/fcm/send/a' }]],
+      ['non-URL endpoint', [{ ...SUB_A, endpoint: 'fcm.googleapis.com/fcm/send/a' }]],
+            ['endpoint too long', [{ ...SUB_A, endpoint: `${FCM}${'a'.repeat(1024 - FCM.length + 1)}` }]],
+      ['p256dh too long', [{ ...SUB_A, keys: { ...SUB_A.keys, p256dh: 'x'.repeat(257) } }]],
+      ['auth too long', [{ ...SUB_A, keys: { ...SUB_A.keys, auth: 'x'.repeat(257) } }]],
+      ['more than 5 subs', Array.from({ length: 6 }, (_, i) => ({ ...SUB_A, endpoint: `${FCM}${i}` }))],
+      ['missing keys', [{ endpoint: SUB_A.endpoint }]],
+      ['missing auth', [{ endpoint: SUB_A.endpoint, keys: { p256dh: 'BPa' } }]],
+      ['missing p256dh', [{ endpoint: SUB_A.endpoint, keys: { auth: 'aa' } }]],
+      ['non-string key', [{ endpoint: SUB_A.endpoint, keys: { p256dh: 1, auth: 'aa' } }]],
+      ['keys is null', [{ endpoint: SUB_A.endpoint, keys: null }]],
+      ['one bad sub among good ones', [SUB_A, { endpoint: 'http://x.test/' , keys: SUB_A.keys }]],
+      ['sub is null', [null]],
+      ['sub is a string', [SUB_A.endpoint]],
+      ['subs not an array', { 0: SUB_A }],
+      ['subs missing', undefined],
+    ];
+    for (const [name, subs] of cases) {
+      it(name, async () => {
+        const push = new FakePusher();
+        const hub = makeHub({ push });
+        const pc = await pcAlone(hub);
+        await hub.handle(pc, { t: 'announce', subs });
+        expect(pc.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+        expect(push.calls).toHaveLength(0);
+      });
+    }
+
+    it('accepts exactly 5 subs and max-length fields', async () => {
+      const push = new FakePusher();
+      const hub = makeHub({ push });
+      const pc = await pcAlone(hub);
+      const subs = Array.from({ length: 5 }, (_, i) => ({
+        endpoint: `${FCM}${i}`.padEnd(1024, 'a'),
+        keys: { p256dh: 'p'.repeat(256), auth: 'a'.repeat(256) },
+      }));
+      await hub.handle(pc, { t: 'announce', subs });
+      expect(push.calls).toHaveLength(1);
+      expect(push.calls[0].subs).toHaveLength(5);
+    });
+  });
+
+  // The server POSTs to whatever endpoint it is given, so only real push-service hosts are allowed (anti-SSRF)
+  describe('endpoint host allowlist', () => {
+    const rejected = [
+      'https://127.0.0.1/x',
+      'https://localhost/x',
+      'https://evil.example/x',
+      'https://fcm.googleapis.com.evil.example/x',
+      'https://evilfcm.googleapis.com/x', // suffix without a dot boundary
+      'https://[::1]/x',
+      'https://169.254.169.254/latest/meta-data',
+      'https://10.0.0.1/x',
+      'https://fcm.googleapis.com:8443/fcm/send/x', // explicit port
+      'https://user:pw@fcm.googleapis.com/fcm/send/x', // credentials
+      'https://evil.example@fcm.googleapis.com/x', // credentials that look like a host
+      'https://fcm.googleapis.com@evil.example/x', // the real host is evil.example
+      'http://web.push.apple.com/x',
+      'https://push.apple.com.evil.example/x',
+      'https://apple.com/x',
+      'wss://fcm.googleapis.com/x',
+    ];
+    for (const endpoint of rejected) {
+      it(`rejects ${endpoint}`, async () => {
+        const push = new FakePusher();
+        const hub = makeHub({ push });
+        const pc = await pcAlone(hub);
+        await hub.handle(pc, { t: 'announce', subs: [{ ...SUB_A, endpoint }] });
+        expect(pc.take()).toEqual([{ t: 'error', code: 'bad_message' }]);
+        expect(push.calls).toHaveLength(0);
+        expect(isPushEndpoint(endpoint)).toBe(false);
+      });
+    }
+
+    const accepted = [
+      'https://web.push.apple.com/QGuQyavXutnMH',
+      'https://api.push.apple.com/x',
+      'https://push.apple.com/x',
+      'https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM',
+      'https://updates.push.services.mozilla.com/wpush/v2/gAAAAA',
+      'https://wns2-by3p.notify.windows.com/w/?token=BQYAAAB',
+      'https://FCM.GoogleAPIs.com/fcm/send/x', // hostnames are case-insensitive
+      'https://fcm.googleapis.com:443/fcm/send/x', // the default port is the same URL
+    ];
+    for (const endpoint of accepted) {
+      it(`accepts ${endpoint}`, async () => {
+        const push = new FakePusher();
+        const hub = makeHub({ push });
+        const pc = await pcAlone(hub);
+        await hub.handle(pc, { t: 'announce', subs: [{ ...SUB_A, endpoint }] });
+        expect(push.calls).toHaveLength(1);
+      });
+    }
+  });
+
+  describe('rate limits', () => {
+    it('at most 3 sends per connection, even across rooms the cooldown would allow', async () => {
+      vi.useFakeTimers();
+      try {
+        const push = new FakePusher();
+        const hub = makeHub({ push, announceCooldownMs: 1000 });
+        const pc = await pcAlone(hub);
+        for (let i = 0; i < 3; i++) {
+          await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+          vi.advanceTimersByTime(1000);
+        }
+        expect(push.calls).toHaveLength(3);
+        pc.take();
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+        expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+        expect(push.calls).toHaveLength(3);
+        // The same connection re-hosting (room switch) does not reset its count
+        await hub.handle(pc, { t: 'host', room: ROOM2 });
+        pc.take();
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+        expect(pc.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+        expect(push.calls).toHaveLength(3);
+        // A new connection for the same room has its own allowance
+        hub.disconnect(pc);
+        const pc2 = await pcAlone(hub);
+        await hub.handle(pc2, { t: 'announce', subs: [SUB_A] });
+        expect(push.calls).toHaveLength(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('skipped announces (cooldown, phone present) do not use up the per-connection allowance', async () => {
+      vi.useFakeTimers();
+      try {
+        const push = new FakePusher();
+        const hub = makeHub({ push, announceCooldownMs: 1000 });
+        const pc = await pcAlone(hub);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] }); // sent (1)
+        for (let i = 0; i < 5; i++) await hub.handle(pc, { t: 'announce', subs: [SUB_A] }); // cooldown
+        vi.advanceTimersByTime(1000);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] }); // sent (2)
+        expect(push.calls).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('at most 30 sends per minute server-wide, then the window frees up', async () => {
+      vi.useFakeTimers();
+      try {
+        const push = new FakePusher();
+        const hub = makeHub({ push });
+        const roomN = (i: number) => `room-limit-${String(i).padStart(6, '0')}`;
+        const pcs: FakeConn[] = [];
+        for (let i = 0; i < 30; i++) {
+          const pc = await pcAlone(hub, roomN(i));
+          await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+          pcs.push(pc);
+          vi.advanceTimersByTime(100);
+        }
+        expect(push.calls).toHaveLength(30);
+        const late = await pcAlone(hub, roomN(30));
+        await hub.handle(late, { t: 'announce', subs: [SUB_A] });
+        expect(late.take()).toEqual([{ t: 'announced', sent: 0, gone: [] }]);
+        expect(push.calls).toHaveLength(30);
+
+        // The first announce was at t=0 and it's now t=3000: one slot frees at t=60000
+        vi.advanceTimersByTime(60_000 - 3000 - 1);
+        await hub.handle(late, { t: 'announce', subs: [SUB_A] });
+        expect(push.calls).toHaveLength(30);
+        vi.advanceTimersByTime(1);
+        await hub.handle(late, { t: 'announce', subs: [SUB_A] });
+        expect(push.calls).toHaveLength(31);
+        void pcs;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a refused announce (global limit) does not start the room cooldown', async () => {
+      vi.useFakeTimers();
+      try {
+        const push = new FakePusher();
+        const hub = makeHub({ push });
+        for (let i = 0; i < 30; i++) {
+          const pc = await pcAlone(hub, `room-fill-${String(i).padStart(8, '0')}`);
+          await hub.handle(pc, { t: 'announce', subs: [SUB_A] });
+        }
+        const pc = await pcAlone(hub);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] }); // refused: window full
+        vi.advanceTimersByTime(60_000);
+        await hub.handle(pc, { t: 'announce', subs: [SUB_A] }); // window empty, room cooldown never started
+        expect(push.calls).toHaveLength(31);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+});
+
+describe('isPushSub / isPhoneToPcMsg', () => {
+  it('isPushSub accepts a browser-shaped subscription and rejects junk', () => {
+    expect(isPushSub(SUB_A)).toBe(true);
+    expect(isPushSub({ ...SUB_A, expirationTime: null })).toBe(true);
+    for (const bad of [null, undefined, 1, 'x', [], {}, { endpoint: SUB_A.endpoint }, { keys: SUB_A.keys }]) {
+      expect(isPushSub(bad)).toBe(false);
+    }
+  });
+
+  it('isPhoneToPcMsg: push_sub needs a valid sub, push_unsub a bounded string', () => {
+    expect(isPhoneToPcMsg({ t: 'push_sub', sub: SUB_A })).toBe(true);
+    expect(isPhoneToPcMsg({ t: 'push_sub', sub: { ...SUB_A, endpoint: 'https://evil.example/x' } })).toBe(false);
+    expect(isPhoneToPcMsg({ t: 'push_sub' })).toBe(false);
+    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: SUB_A.endpoint })).toBe(true);
+    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: 'x'.repeat(1025) })).toBe(false);
+    expect(isPhoneToPcMsg({ t: 'push_unsub', endpoint: 5 })).toBe(false);
+    expect(isPhoneToPcMsg({ t: 'fx_file', name: 'a', b64: '' })).toBe(false);
+    expect(isPhoneToPcMsg(null)).toBe(false);
+    expect(isPhoneToPcMsg('push_sub')).toBe(false);
   });
 });

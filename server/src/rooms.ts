@@ -1,7 +1,7 @@
 // Room + floor logic, independent of the transport so it can be tested directly.
 
 import { timingSafeEqual, createHash, randomInt } from 'node:crypto';
-import { MAX_TX_MS, PAIR_CODE_RE, PAIR_CODE_TTL_MS, ROOM_CODE_RE, type ClientMsg, type FloorHolder, type Role, type ServerMsg } from '@pit/shared';
+import { MAX_PUSH_SUBS, MAX_TX_MS, PAIR_CODE_RE, PAIR_CODE_TTL_MS, isPushSub, type PushSub, ROOM_CODE_RE, type ClientMsg, type FloorHolder, type Role, type ServerMsg } from '@pit/shared';
 
 export interface Conn {
   send(msg: ServerMsg): void;
@@ -28,12 +28,25 @@ export interface HubOptions {
   maxRooms?: number;
   /** When set, host/join must carry this key. Keeps a self-hosted server private. */
   accessKey?: string;
+  /** Sends Web Push notifications; absent when VAPID keys aren't configured */
+  push?: Pusher | null;
+  /** Minimum time between "PC online" notifications for one room */
+  announceCooldownMs?: number;
+}
+
+export interface Pusher {
+  /** Returns the endpoints the push service reported as expired/unsubscribed */
+  send(subs: PushSub[], payload: object): Promise<{ sent: number; gone: string[] }>;
 }
 
 /** Wrong pairing codes allowed per connection, and server-wide per window, before refusing */
 const PAIR_TRIES_PER_CONN = 5;
 const PAIR_FAILS_PER_WINDOW = 30;
 const PAIR_FAIL_WINDOW_MS = 10 * 60_000;
+
+const ANNOUNCES_PER_CONN = 3;
+const ANNOUNCES_PER_WINDOW = 30;
+const ANNOUNCE_WINDOW_MS = 60_000;
 
 const other = (r: Role): Role => (r === 'pc' ? 'phone' : 'pc');
 
@@ -47,9 +60,13 @@ export class RoomHub {
   private pairCodes = new Map<string, { room: string; expires: number }>();
   private pairTries = new WeakMap<Conn, number>();
   private pairFails: number[] = [];
+  /** room code -> last time we sent "PC online" for it */
+  private lastAnnounce = new Map<string, number>();
+  private announcesPerConn = new WeakMap<Conn, number>();
+  private announceTimes: number[] = [];
 
   constructor(opts: HubOptions) {
-    this.opts = { maxTxMs: MAX_TX_MS, maxRooms: 1000, accessKey: '', ...opts };
+    this.opts = { maxTxMs: MAX_TX_MS, maxRooms: 1000, accessKey: '', push: null, announceCooldownMs: 120_000, ...opts };
   }
 
   async handle(conn: Conn, raw: unknown): Promise<void> {
@@ -94,6 +111,11 @@ export class RoomHub {
       }
       case 'floor_release': {
         if (room.floor === m.role) this.setFloor(room, 'idle');
+        break;
+      }
+      case 'announce': {
+        if (m.role !== 'pc') break;
+        await this.announce(conn, room, msg.subs);
         break;
       }
       case 'pair_create': {
@@ -141,6 +163,44 @@ export class RoomHub {
     }
     this.pairCodes.delete(code);
     conn.send({ t: 'paired', room: entry.room, key: this.opts.accessKey });
+  }
+
+  /** Tell the room's phones the PC is online, unless a phone is already here. */
+  private async announce(conn: Conn, room: Room, subs: PushSub[]): Promise<void> {
+    const now = Date.now();
+    const last = this.lastAnnounce.get(room.code) ?? 0;
+    // Limits so one client can't use announce to make the server send lots of requests:
+    // a PC announces once per launch, so a few per connection and a modest global rate is plenty.
+    this.announceTimes = this.announceTimes.filter((t) => now - t < ANNOUNCE_WINDOW_MS);
+    const perConn = this.announcesPerConn.get(conn) ?? 0;
+    if (
+      !this.opts.push ||
+      room.phone ||
+      subs.length === 0 ||
+      now - last < this.opts.announceCooldownMs ||
+      perConn >= ANNOUNCES_PER_CONN ||
+      this.announceTimes.length >= ANNOUNCES_PER_WINDOW
+    ) {
+      conn.send({ t: 'announced', sent: 0, gone: [] });
+      return;
+    }
+    this.announcesPerConn.set(conn, perConn + 1);
+    this.announceTimes.push(now);
+    // Re-insert so the map stays in least-recently-announced order for eviction
+    this.lastAnnounce.delete(room.code);
+    this.lastAnnounce.set(room.code, now);
+    if (this.lastAnnounce.size > 1000) this.lastAnnounce.delete(this.lastAnnounce.keys().next().value!);
+    try {
+      const res = await this.opts.push.send(subs, {
+        title: 'Pit Princess',
+        body: 'The PC is online. Tap to open the radio.',
+        tag: 'pc-online',
+      });
+      conn.send({ t: 'announced', ...res });
+    } catch (e) {
+      console.warn('[push] announce failed', e instanceof Error ? e.message : e);
+      conn.send({ t: 'announced', sent: 0, gone: [] });
+    }
   }
 
   private keyOk(key: string | undefined): boolean {
@@ -304,6 +364,10 @@ function parseClientMsg(raw: unknown): ClientMsg | null {
     case 'kick':
     case 'pair_create':
       return { t: m.t };
+    case 'announce': {
+      if (!Array.isArray(m.subs) || m.subs.length > MAX_PUSH_SUBS || !m.subs.every(isPushSub)) return null;
+      return { t: 'announce', subs: m.subs.map((s: PushSub) => ({ endpoint: s.endpoint, keys: { p256dh: s.keys.p256dh, auth: s.keys.auth } })) };
+    }
     case 'pair_claim':
       return typeof m.code === 'string' && m.code.length <= 16 ? { t: 'pair_claim', code: m.code } : null;
     default:

@@ -19,6 +19,7 @@ import {
   type NoiseMode,
 } from '@pit/shared';
 import { createRadioContext, prepareRnnoise } from '@pit/shared/noise';
+import { initPush, sendSubscriptionToPc } from './push.ts';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const ptt = $<HTMLButtonElement>('ptt');
@@ -61,6 +62,8 @@ let micStream: MediaStream | null = null;
 let micSource: MediaStreamAudioSourceNode | null = null;
 let tx: TxProcessor | null = null;
 let micGeneration = 0;
+/** Copy of the mic track that is sent in the raw path; the original stays on for analysis */
+let sentClone: MediaStreamTrack | null = null;
 
 const NOISE_KEY = 'pit-princess-noise';
 const NOISE_LABEL: Record<NoiseMode, string> = { strong: 'Strong (AI)', standard: 'Standard', off: 'Off' };
@@ -185,6 +188,8 @@ async function connect(): Promise<void> {
     accessKey,
     fx,
     onChange: render,
+    // Each new connection to the PC refreshes its copy of our push subscription
+    onDataOpen: () => void sendSubscriptionToPc(link),
     onData: (msg) => {
       if (!isFxFileMsg(msg) || !fx) return;
       const bytes = b64ToBytes(msg.b64);
@@ -193,11 +198,12 @@ async function connect(): Promise<void> {
       });
     },
   });
-  link.setMicTrack(tx?.track ?? micStream?.getAudioTracks()[0] ?? null);
+  link.setMicTrack(tx?.track ?? sentClone);
   link.start();
   render(link.getState());
   bindPtt();
   bindNoiseToggle();
+  initPush(() => link, $<HTMLButtonElement>('notify'));
   void requestWakeLock();
   requestAnimationFrame(meterLoop);
 }
@@ -213,20 +219,45 @@ async function openMic(): Promise<void> {
   const rnnoise = noiseMode === 'strong' ? await prepareRnnoise(ctx) : null;
   // No RNNoise on this device: fall back to the browser's own suppression
   const effective: NoiseMode = noiseMode === 'strong' && !rnnoise ? 'standard' : noiseMode;
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints('default', effective, true) });
-  if (gen !== micGeneration) {
-    stream.getTracks().forEach((t) => t.stop());
-    return;
+  const constraints = micConstraints('default', effective, true);
+
+  // Each getUserMedia call can show the permission prompt again on iOS, so the mic is only
+  // opened once per launch. Changing the noise mode adjusts the open track instead.
+  const open = micStream?.getAudioTracks()[0];
+  let notApplied = false;
+  if (micStream && open?.readyState === 'live') {
+    try {
+      await open.applyConstraints(constraints);
+    } catch (e) {
+      console.warn('[mic] applyConstraints failed, keeping current settings', e);
+    }
+    if (gen !== micGeneration) return;
+    // Some browsers accept the call but keep the old setting; say so rather than mislabel it
+    const ns = open.getSettings().noiseSuppression;
+    notApplied = typeof ns === 'boolean' && ns !== constraints.noiseSuppression;
+  } else {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+    if (gen !== micGeneration) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    micStream?.getTracks().forEach((t) => t.stop());
+    micStream = stream;
   }
+  const stream = micStream!;
+  const raw = stream.getAudioTracks()[0];
   // Opening the mic switches the iOS audio session, which can interrupt the context and pause playback
   fx.unlock();
   tx?.dispose();
   tx = null;
   micSource?.disconnect();
   micSource = null;
-  micStream?.getTracks().forEach((t) => t.stop());
-  micStream = stream;
 
+  // The raw track always stays on (it feeds RNNoise and the meter). What gets sent and keyed is
+  // either the RNNoise output or a clone, so swapping paths never puts the open mic on the wire.
+  raw.enabled = true;
+  const oldClone = sentClone;
+  sentClone = null;
   let track: MediaStreamTrack;
   if (rnnoise) {
     tx = new TxProcessor(ctx, stream, { noiseNode: rnnoise });
@@ -234,20 +265,23 @@ async function openMic(): Promise<void> {
     micAnalyser = tx.analyser;
     track = tx.track;
   } else {
-    track = stream.getAudioTracks()[0];
+    track = raw.clone();
     track.enabled = false;
+    sentClone = track;
     micAnalyser = ctx.createAnalyser();
     micAnalyser.fftSize = 512;
     micSource = ctx.createMediaStreamSource(stream);
     micSource.connect(micAnalyser);
   }
   link?.setMicTrack(track);
-  renderNoise(noiseMode !== effective);
+  oldClone?.stop();
+  renderNoise(noiseMode !== effective, notApplied);
 }
 
-function renderNoise(fellBack = false): void {
+function renderNoise(fellBack = false, notApplied = false): void {
   const el = $<HTMLButtonElement>('nr');
-  el.textContent = `Noise filter: ${fellBack ? 'Standard (AI unavailable)' : NOISE_LABEL[noiseMode]}`;
+  const label = fellBack ? 'Standard (AI unavailable)' : NOISE_LABEL[noiseMode];
+  el.textContent = `Noise filter: ${label}${notApplied ? ' (reopen app to apply)' : ''}`;
   el.hidden = false;
 }
 

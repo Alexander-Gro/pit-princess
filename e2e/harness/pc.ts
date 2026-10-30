@@ -1,6 +1,6 @@
 // Test-only harness: runs RadioLink with role 'pc' in a browser page and exposes its state.
 // Not part of any production build. Query params: ws=<signaling url>&room=<code>
-import { RadioFx, RadioLink, type LinkState } from '@pit/shared';
+import { RadioFx, RadioLink, isPhoneToPcMsg, type LinkState, type PushSub } from '@pit/shared';
 
 declare global {
   interface Window {
@@ -16,6 +16,12 @@ declare global {
       kick(): void;
       /** bytesReceived on the inbound audio RTP stream (Opus sends only tiny frames for a disabled track). */
       rxBytes(): Promise<number>;
+      /** Data channel messages from the phone, and whether each passed isPhoneToPcMsg (what the PC app checks) */
+      data: { msg: unknown; valid: boolean }[];
+      dataOpenCount: number;
+      /** Send {t:'announce'} to the server; replies land in `announced` */
+      announce(subs: PushSub[]): boolean;
+      announced: { sent: number; gone: string[] }[];
     };
   }
 }
@@ -32,6 +38,10 @@ const pit: Window['pit'] = {
   down: () => link?.pttDown(),
   up: (immediate) => link?.pttUp(immediate),
   kick: () => link?.kick(),
+  data: [],
+  dataOpenCount: 0,
+  announce: (subs) => link?.announce(subs) ?? false,
+  announced: [],
   rxBytes: async () => {
     // Test-only peek at the private peer connection.
     const peer = (link as unknown as { pc: RTCPeerConnection | null } | null)?.pc;
@@ -72,6 +82,9 @@ async function main(): Promise<void> {
       pit.history.push(s);
       document.getElementById('state')!.textContent = JSON.stringify(s, null, 1);
     },
+    onData: (msg) => pit.data.push({ msg, valid: isPhoneToPcMsg(msg) }),
+    onDataOpen: () => pit.dataOpenCount++,
+    onAnnounced: (sent, gone) => pit.announced.push({ sent, gone }),
   });
   link.setMicTrack(track);
   link.start();

@@ -15,6 +15,7 @@ const DEFAULTS: Settings = {
   micGain: 1,
   feedbackSuppression: true,
   noise: 'strong',
+  pushSubs: [],
   ccFolder: null,
 };
 

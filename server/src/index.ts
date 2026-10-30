@@ -11,6 +11,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { RoomHub, type Conn } from './rooms.ts';
 import { createIceProvider } from './ice.ts';
+import { createPusher } from './push.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8787);
@@ -26,7 +27,9 @@ const ICE_REFRESH_MS = 3 * 3600_000;
 
 const ice = createIceProvider();
 const ACCESS_KEY = process.env.ACCESS_KEY ?? '';
-const hub = new RoomHub({ getIceServers: ice.get, accessKey: ACCESS_KEY });
+// publicUrl() is a hoisted function declaration, so it's safe to call here
+const push = createPusher(process.env, publicUrl());
+const hub = new RoomHub({ getIceServers: ice.get, accessKey: ACCESS_KEY, push: push.pusher });
 
 function lanAddress(): string | null {
   for (const list of Object.values(networkInterfaces())) {
@@ -105,7 +108,7 @@ function onRequest(req: IncomingMessage, res: ServerResponse): void {
   if (path === '/api/info') {
     res
       .writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' })
-      .end(JSON.stringify({ publicUrl: publicUrl() }));
+      .end(JSON.stringify({ publicUrl: publicUrl(), vapidPublicKey: push.publicKey }));
     return;
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -210,6 +213,7 @@ http.on('upgrade', onUpgrade);
 http.listen(PORT, () => {
   console.log(`[pit-princess] http on :${PORT}  ICE: ${ice.describe}`);
   console.log(`[pit-princess] phone URL base: ${publicUrl()}`);
+  console.log(`[pit-princess] push notifications: ${push.publicKey ? 'on' : 'off (no VAPID keys)'}`);
   console.log(`[pit-princess] access key: ${ACCESS_KEY ? 'required' : 'NOT set (open server; fine for localhost)'}`);
 });
 

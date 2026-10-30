@@ -77,6 +77,11 @@ Keep the access key out of the repo. It belongs only in Render's environment set
 
 The free Render tier sleeps after about 15 minutes with no traffic, and the first connection after that takes up to about a minute.
 
+### Push notifications (optional)
+The phone can get a "PC is online" notification when you start the PC app. In Render, set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`. You can generate a pair with `npx web-push generate-vapid-keys`. Then, on the phone, tap **Notify me when PC is online**. On iPhone this only works in the home-screen app (iOS 16.4 or later).
+
+The server stores no subscriptions. The PC app keeps them, and when it starts it asks the server to notify the phone. No notification is sent if the phone is already connected.
+
 ## Using it
 
 1. **Bind wheel button**: click it, then press the button on your wheel. The button works while the sim has focus.

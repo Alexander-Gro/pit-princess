@@ -15,6 +15,9 @@ import {
   bytesToB64,
   micConstraints,
   generateRoomCode,
+  isPhoneToPcMsg,
+  MAX_PUSH_SUBS,
+  type PushSub,
   readLevel,
   type CcSoundName,
   type FxFileMsg,
@@ -172,6 +175,16 @@ function startLink(): void {
     onChange: render,
     onDataOpen: sendSoundsToPhone,
     onPairCode: showPairCode,
+    onData: onPhoneMessage,
+    onWelcome: () => {
+      // "PC is online" goes out once per app launch, not on every reconnect
+      if (announced || !settings.pushSubs.length) return;
+      if (link?.announce(settings.pushSubs)) announced = true;
+    },
+    onAnnounced: (sent, gone) => {
+      if (gone.length) void updatePushSubs((subs) => subs.filter((s) => !gone.includes(s.endpoint)));
+      $('v-push').textContent = sent ? `Notified ${sent} phone${sent > 1 ? 's' : ''} that the PC is online.` : pushHint();
+    },
   });
   const track = tx?.track ?? null;
   link.setMicTrack(track);
@@ -229,6 +242,43 @@ function render(s: LinkState): void {
   // The code is single-use: once the phone is in, hide it
   if (s.peer === 'connected' && pairTimer) clearPairCode('Phone paired.');
   $('v-phone').textContent = !s.peerPresent ? 'No phone' : s.peer === 'connected' ? 'Phone connected' : 'Phone linking…';
+}
+
+// ---------- push notifications ----------
+
+let announced = false;
+
+function pushHint(): string {
+  const n = settings.pushSubs.length;
+  return n ? `"PC online" alerts: ${n} phone${n > 1 ? 's' : ''}.` : '';
+}
+
+let pushSave: Promise<void> = Promise.resolve();
+
+/**
+ * Change the stored subscriptions. Updates are chained, and each one starts from the result of
+ * the previous, so overlapping changes (a new phone + an expired one) can't overwrite each other.
+ */
+function updatePushSubs(change: (subs: PushSub[]) => PushSub[]): Promise<void> {
+  pushSave = pushSave
+    .then(async () => {
+      settings = await pit.setSettings({ pushSubs: change(settings.pushSubs) });
+      $('v-push').textContent = pushHint();
+    })
+    .catch((e) => console.warn('[push] save failed', e));
+  return pushSave;
+}
+
+function onPhoneMessage(msg: unknown): void {
+  if (!isPhoneToPcMsg(msg)) return;
+  if (msg.t === 'push_sub') {
+    const sub = msg.sub;
+    // Newest first; drop the oldest beyond the limit
+    void updatePushSubs((subs) => [sub, ...subs.filter((s) => s.endpoint !== sub.endpoint)].slice(0, MAX_PUSH_SUBS));
+  } else {
+    const endpoint = msg.endpoint;
+    void updatePushSubs((subs) => subs.filter((s) => s.endpoint !== endpoint));
+  }
 }
 
 // ---------- pairing code ----------
@@ -358,7 +408,9 @@ function wireUi(): void {
   $('b-newcode').addEventListener('click', async () => {
     if (!confirm('Create a new pairing code? The current phone will be disconnected.')) return;
     link?.kick();
+    // A new code shuts out the old phone, so stop notifying it too
     settings = await pit.setSettings({ room: generateRoomCode() });
+    await updatePushSubs(() => []);
     startLink();
   });
   $('b-kick').addEventListener('click', () => link?.kick());
@@ -455,6 +507,8 @@ function wireUi(): void {
     settings = await pit.setSettings({ serverUrl: value, accessKey: keyInput.value.trim() });
     server.value = settings.serverUrl;
     keyInput.value = settings.accessKey;
+    // A different server hasn't heard we're online yet
+    announced = false;
     startLink();
   });
   const keyInput = $<HTMLInputElement>('i-key');
@@ -502,6 +556,7 @@ async function boot(): Promise<void> {
   await populateDevices();
   joys = await pit.listJoysticks();
   renderBinding();
+  $('v-push').textContent = pushHint();
   startLink();
   await applyCrewChief(await pit.loadCrewChief());
   requestAnimationFrame(meterLoop);
