@@ -2,10 +2,10 @@
 // static bed and Crew Chief bleeps when the channel opens and closes.
 //
 // Signal flow:
-//   remote voice -> highpass -> lowpass -> compressor -> drive (level-compensated) -> voice gain -> gate -> master
+//   remote voice -> highpass -> lowpass -> auto level -> compressor -> drive (level-compensated) -> voice gain -> gate -> master
 //   static noise -> bandpass -> static gain ---------------------------------------------------------^
 //   bleeps / busy tone -> bleep gain ----------------------------------------------------------------^
-//   master -> speakers (or an <audio> element on iOS, see `output`)
+//   master -> limiter -> speakers (or an <audio> element on iOS, see `output`)
 
 export const CC_SOUND_NAMES = [
   'start_bleep',
@@ -28,6 +28,8 @@ export interface RadioFxSettings {
   drive: number;
   /** Radio bandwidth, 0 = narrow walkie-talkie .. 1 = wide and clear */
   band: number;
+  /** Automatic voice leveling, 0 = off .. 1 = bring every talker to the same loudness */
+  level: number;
 }
 
 export const DEFAULT_FX: RadioFxSettings = {
@@ -37,6 +39,7 @@ export const DEFAULT_FX: RadioFxSettings = {
   staticLevel: 0.25,
   drive: 0.35,
   band: 0.4,
+  level: 0.7,
 };
 
 /** Allowed range of each setting, for sliders and for validating stored values. */
@@ -47,12 +50,22 @@ export const FX_RANGES: Record<keyof RadioFxSettings, [min: number, max: number]
   staticLevel: [0, 1],
   drive: [0, 1],
   band: [0, 1],
+  level: [0, 1],
 };
 
 /** How long the channel stays open after the far side releases, so the voice tail isn't clipped. */
 export const RX_TAIL_MS = 180;
 
 const STATIC_PEAK = 0.06;
+
+// Auto level: measured on the filtered voice before any gain, as RMS in dBFS.
+/** Speech level every talker is brought to */
+const LEVEL_TARGET_DB = -20;
+/** Below this it's a pause or background noise: hold the gain rather than boost it */
+const LEVEL_SPEECH_FLOOR_DB = -55;
+const LEVEL_MAX_BOOST_DB = 24;
+const LEVEL_MAX_CUT_DB = -12;
+const LEVEL_FRAME_MS = 50;
 
 export interface RadioFxOptions {
   /**
@@ -74,6 +87,12 @@ export class RadioFx {
   private curveDrive = -1;
   private voiceGain: GainNode;
   private voiceGate: GainNode;
+  private levelGain: GainNode;
+  private levelDetector: AnalyserNode;
+  private levelBuf: Float32Array<ArrayBuffer>;
+  /** Smoothed loudness of the talker's speech, and the correction currently applied */
+  private speechDb = LEVEL_TARGET_DB;
+  private levelDb = 0;
   private staticGain: GainNode;
   private bleepGain: GainNode;
   private outEl: HTMLAudioElement | null = null;
@@ -87,16 +106,24 @@ export class RadioFx {
   constructor(ctx: AudioContext, opts: RadioFxOptions = {}) {
     this.ctx = ctx;
     this.master = ctx.createGain();
+    // Safety limiter on everything we play: a sudden loud moment can't blast the listener or clip
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -3;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.001;
+    limiter.release.value = 0.1;
+    this.master.connect(limiter);
     if (opts.output === 'element') {
       const dest = ctx.createMediaStreamDestination();
-      this.master.connect(dest);
+      limiter.connect(dest);
       const el = new Audio();
       el.setAttribute('playsinline', '');
       el.autoplay = true;
       el.srcObject = dest.stream;
       this.outEl = el;
     } else {
-      this.master.connect(ctx.destination);
+      limiter.connect(ctx.destination);
     }
 
     this.voiceIn = ctx.createGain();
@@ -126,10 +153,15 @@ export class RadioFx {
     this.voiceGate.gain.value = 0;
     this.rxAnalyser = ctx.createAnalyser();
     this.rxAnalyser.fftSize = 512;
+    this.levelGain = ctx.createGain();
+    this.levelDetector = ctx.createAnalyser();
+    this.levelDetector.fftSize = 2048;
+    this.levelBuf = new Float32Array(this.levelDetector.fftSize);
 
-    this.voiceIn
-      .connect(this.hp)
-      .connect(this.lp)
+    this.voiceIn.connect(this.hp).connect(this.lp);
+    this.lp.connect(this.levelDetector);
+    this.lp
+      .connect(this.levelGain)
       .connect(presence)
       .connect(comp)
       .connect(makeup)
@@ -156,6 +188,39 @@ export class RadioFx {
     this.bleepGain.connect(this.master);
 
     this.applySettings(this.settings);
+    setInterval(() => this.updateLevel(), LEVEL_FRAME_MS);
+  }
+
+  /** Current auto-level correction in dB (positive = boosting a quiet talker). */
+  get levelCorrectionDb(): number {
+    return this.levelDb;
+  }
+
+  /**
+   * Auto level: like a radio operator riding the fader. Tracks how loud the talker's speech is
+   * and moves the gain towards the target: down quickly (no blasting), up slowly (no pumping).
+   * Pauses and noise don't count, and the gain is kept between transmissions.
+   */
+  private updateLevel(): void {
+    const amount = this.settings.level;
+    if (amount === 0) {
+      if (this.levelDb !== 0) {
+        this.levelDb = 0;
+        this.levelGain.gain.setTargetAtTime(1, this.ctx.currentTime, 0.05);
+      }
+      return;
+    }
+    if (!this.open) return;
+    this.levelDetector.getFloatTimeDomainData(this.levelBuf);
+    let sum = 0;
+    for (let i = 0; i < this.levelBuf.length; i++) sum += this.levelBuf[i] * this.levelBuf[i];
+    const rmsDb = 10 * Math.log10(sum / this.levelBuf.length + 1e-12);
+    if (rmsDb < LEVEL_SPEECH_FLOOR_DB) return;
+    // Follow speech peaks quickly and its dips slowly, so syllable gaps don't read as "quiet"
+    this.speechDb += (rmsDb - this.speechDb) * (rmsDb > this.speechDb ? 0.3 : 0.04);
+    const wanted = Math.min(LEVEL_MAX_BOOST_DB, Math.max(LEVEL_MAX_CUT_DB, LEVEL_TARGET_DB - this.speechDb)) * amount;
+    this.levelDb += (wanted - this.levelDb) * (wanted < this.levelDb ? 0.35 : 0.08);
+    this.levelGain.gain.setTargetAtTime(10 ** (this.levelDb / 20), this.ctx.currentTime, 0.04);
   }
 
   /**

@@ -235,3 +235,8 @@ label {
 .audio .sliders {
   grid-column: 1 / -1;
 }
+
+/* Radio sound has seven sliders: four per row */
+.sliders:not(.mic) {
+  grid-template-columns: repeat(4, 1fr);
+}
